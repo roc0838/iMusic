@@ -1,0 +1,866 @@
+import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
+
+@MainActor
+final class SearchHistoryStore: ObservableObject {
+    static let shared = SearchHistoryStore()
+
+    @Published private(set) var entries: [String]
+
+    private let key = "moumusic.searchHistory.v1"
+    private let limit = 12
+
+    private init() {
+        entries = UserDefaults.standard.stringArray(forKey: key) ?? []
+    }
+
+    func add(_ value: String) {
+        let query = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        entries.removeAll { $0.localizedCaseInsensitiveCompare(query) == .orderedSame }
+        entries.insert(query, at: 0)
+        entries = Array(entries.prefix(limit))
+        UserDefaults.standard.set(entries, forKey: key)
+    }
+
+    func remove(_ value: String) {
+        entries.removeAll { $0 == value }
+        UserDefaults.standard.set(entries, forKey: key)
+    }
+
+    func clear() {
+        entries.removeAll()
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+
+@MainActor
+final class SearchViewModel: ObservableObject {
+    enum Tab: String, CaseIterable, Identifiable {
+        case all = "综合"
+        case songs = "单曲"
+        case artists = "歌手"
+        case albums = "专辑"
+        case playlists = "歌单"
+
+        var id: String { rawValue }
+    }
+
+    struct ArtistResult: Hashable, Identifiable {
+        let id: String
+        let name: String
+        let neteaseID: Int?
+        let source: LXCatalogPlatform
+        var avatarURL: String?
+    }
+
+    struct AlbumResult: Hashable, Identifiable {
+        let id: String
+        let name: String
+        let artistName: String
+        let coverURL: String?
+        let neteaseID: Int?
+        let source: LXCatalogPlatform
+        let sourceID: String?
+    }
+
+    var query: String
+    @Published var tab: Tab = .all {
+        didSet {
+            guard oldValue != tab else { return }
+            invalidatePendingResults()
+        }
+    }
+    @Published var songs: [Track] = []
+    @Published var artists: [ArtistResult] = []
+    @Published var albums: [AlbumResult] = []
+    @Published var playlists: [LXPlaylistSummary] = []
+    @Published var isLoading = false
+    @Published private(set) var hasAttemptedSearch = false
+    @Published private(set) var errorMessage: String?
+    @Published var loadedTabs: Set<Tab> = []
+    @Published var platform: LXCatalogPlatform = .aggregate
+    @Published private(set) var hotKeywords: [String] = []
+    private var artistAvatarCache: [String: String] = [:]
+    private var requestGeneration = 0
+
+    init(query: String) {
+        self.query = query
+    }
+
+    func setQuery(_ newQuery: String) {
+        guard newQuery != query else { return }
+        query = newQuery
+        invalidatePendingResults()
+    }
+
+    func setPlatform(_ newPlatform: LXCatalogPlatform) {
+        guard newPlatform != platform else { return }
+        platform = newPlatform
+        invalidatePendingResults()
+    }
+
+    func loadHotKeywords() async {
+        let requestedPlatform = platform
+        var keywords = (try? await LXCatalogService.hotKeywords(platform: requestedPlatform)) ?? []
+        guard requestedPlatform == platform else { return }
+
+        // Hot-word endpoints are not equally reliable across platforms. Keep
+        // the page useful with live catalogue names instead of leaving the
+        // hot-search section empty when one provider changes its endpoint.
+        if keywords.count < 6 {
+            let fallback: [String]
+            if requestedPlatform == .aggregate || requestedPlatform == .wy {
+                fallback = (try? await NeteaseAPI.hotSongs(limit: 12))?.map(\.name) ?? []
+            } else {
+                fallback = (try? await LXCatalogService.recommendedTracks(
+                    platform: requestedPlatform, limit: 12
+                ))?.map(\.name) ?? []
+            }
+            keywords.append(contentsOf: fallback)
+        }
+
+        var seen = Set<String>()
+        hotKeywords = keywords
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0.localizedLowercase).inserted }
+            .prefix(12)
+            .map { $0 }
+    }
+
+    private func invalidatePendingResults() {
+        requestGeneration += 1
+        loadedTabs.removeAll()
+        songs = []
+        artists = []
+        albums = []
+        playlists = []
+        hotKeywords = []
+        isLoading = false
+        hasAttemptedSearch = false
+        errorMessage = nil
+    }
+
+    func load(tab: Tab, force: Bool = false) async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, force || !loadedTabs.contains(tab) else { return }
+
+        let generation = requestGeneration
+        hasAttemptedSearch = true
+        errorMessage = nil
+        isLoading = true
+        defer {
+            if generation == requestGeneration { isLoading = false }
+        }
+
+        func isCurrentRequest() -> Bool {
+            generation == requestGeneration
+        }
+
+        var didLoad = false
+        var didFail = false
+        switch tab {
+        case .all:
+            async let songsTask: [Track]? = try? await LXCatalogService.search(
+                trimmed, platform: platform, limit: 12
+            )
+            async let playlistsTask: [LXPlaylistSummary]? = try? await LXCatalogService.searchSonglists(
+                trimmed, platform: platform, limit: 12
+            )
+            if let result = await songsTask {
+                guard isCurrentRequest() else { return }
+                songs = result
+                rebuildMetadata(from: result)
+                await enrichArtistAvatars(generation: generation)
+                guard isCurrentRequest() else { return }
+                didLoad = true
+            } else {
+                didFail = true
+            }
+            if let result = await playlistsTask {
+                guard isCurrentRequest() else { return }
+                playlists = result
+                didLoad = true
+            } else {
+                didFail = true
+            }
+        case .songs:
+            do {
+                let result = try await LXCatalogService.search(trimmed, platform: platform, limit: 100)
+                guard isCurrentRequest() else { return }
+                songs = result
+                rebuildMetadata(from: result)
+                await enrichArtistAvatars(generation: generation)
+                guard isCurrentRequest() else { return }
+                didLoad = true
+            } catch {
+                didFail = true
+            }
+        case .artists:
+            if platform == .wy {
+                do {
+                    let result = try await NeteaseAPI.search(trimmed, type: .artists, limit: 100)
+                    guard isCurrentRequest() else { return }
+                    artists = (result.artists ?? []).map {
+                        ArtistResult(id: "wy-\($0.id)", name: $0.name,
+                                     neteaseID: $0.id, source: .wy, avatarURL: $0.picUrl)
+                    }
+                    didLoad = true
+                } catch {
+                    didFail = true
+                }
+            } else {
+                do {
+                    let result = try await LXCatalogService.search(trimmed, platform: platform, limit: 100)
+                    guard isCurrentRequest() else { return }
+                    songs = result
+                    rebuildMetadata(from: songs)
+                    await enrichArtistAvatars(generation: generation)
+                    guard isCurrentRequest() else { return }
+                    didLoad = true
+                } catch {
+                    didFail = true
+                }
+            }
+        case .albums:
+            do {
+                let result = try await LXCatalogService.search(trimmed, platform: platform, limit: 100)
+                guard isCurrentRequest() else { return }
+                songs = result
+                rebuildMetadata(from: songs)
+                await enrichArtistAvatars(generation: generation)
+                guard isCurrentRequest() else { return }
+                didLoad = true
+            } catch {
+                didFail = true
+            }
+        case .playlists:
+            do {
+                let result = try await LXCatalogService.searchSonglists(trimmed, platform: platform, limit: 100)
+                guard isCurrentRequest() else { return }
+                playlists = result
+                didLoad = true
+            } catch {
+                didFail = true
+            }
+        }
+
+        if didLoad, isCurrentRequest() { loadedTabs.insert(tab) }
+        if didFail, isCurrentRequest(), !hasResults(for: tab) {
+            errorMessage = String(localized: "搜索服务暂时不可用，请稍后重试")
+        }
+    }
+
+    private func hasResults(for tab: Tab) -> Bool {
+        switch tab {
+        case .all:
+            return !songs.isEmpty || !artists.isEmpty || !albums.isEmpty || !playlists.isEmpty
+        case .songs:
+            return !songs.isEmpty
+        case .artists:
+            return !artists.isEmpty
+        case .albums:
+            return !albums.isEmpty
+        case .playlists:
+            return !playlists.isEmpty
+        }
+    }
+
+    private func rebuildMetadata(from tracks: [Track]) {
+        var artistResults: [ArtistResult] = []
+        var albumResults: [AlbumResult] = []
+        var seenArtists = Set<String>()
+        var seenAlbums = Set<String>()
+
+        for track in tracks {
+            let trackSource = platform == .aggregate
+                ? (track.source.flatMap { LXCatalogPlatform(rawValue: $0) } ?? .wy)
+                : platform
+            for artist in track.artists {
+                let name = artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { continue }
+                let key = "\(trackSource.rawValue)|\(name.localizedLowercase)"
+                if seenArtists.insert(key).inserted {
+                    artistResults.append(ArtistResult(
+                        id: key,
+                        name: name,
+                        neteaseID: artist.id > 0 && trackSource == .wy ? artist.id : nil,
+                        source: trackSource,
+                        avatarURL: artist.picUrl
+                    ))
+                } else if let avatarURL = artist.picUrl,
+                          let index = artistResults.firstIndex(where: { $0.id == key }),
+                          artistResults[index].avatarURL == nil {
+                    artistResults[index].avatarURL = avatarURL
+                }
+            }
+
+            let albumName = track.album.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !albumName.isEmpty else { continue }
+            let albumKey = "\(trackSource.rawValue)|\(albumName.localizedLowercase)|\(track.artistNames.localizedLowercase)"
+            guard seenAlbums.insert(albumKey).inserted else { continue }
+            let sourceID = [track.sourceMetadata["albumMid"], track.sourceMetadata["albumId"]]
+                .compactMap { value -> String? in
+                    guard let value, !value.isEmpty else { return nil }
+                    return value
+                }
+                .first ?? (track.album.id > 0 ? String(track.album.id) : nil)
+            albumResults.append(AlbumResult(
+                id: albumKey,
+                name: albumName,
+                artistName: track.artistNames,
+                coverURL: track.album.picUrl,
+                neteaseID: track.album.id > 0 && trackSource == .wy ? track.album.id : nil,
+                source: trackSource,
+                sourceID: sourceID
+            ))
+        }
+
+        artists = artistResults
+        albums = albumResults
+    }
+
+    /// LX search results do not consistently include artist artwork. Enrich
+    /// only the visible artist cards with public NetEase artist metadata. The
+    /// selected catalogue still owns the actual song and playback results.
+    private func enrichArtistAvatars(generation: Int) async {
+        let targets = artists.compactMap { artist -> (id: String, name: String, neteaseID: Int?)? in
+            guard artist.avatarURL == nil, artistAvatarCache[artist.id] == nil else { return nil }
+            return (artist.id, artist.name, artist.neteaseID)
+        }
+        guard !targets.isEmpty else {
+            guard generation == requestGeneration else { return }
+            applyCachedArtistAvatars()
+            return
+        }
+
+        let responses = await withTaskGroup(of: (String, String?).self, returning: [(String, String?)].self) { group in
+            for target in targets.prefix(8) {
+                group.addTask {
+                    if let neteaseID = target.neteaseID, neteaseID > 0 {
+                        let response = try? await NeteaseAPI.artist(id: neteaseID)
+                        return (target.id, response?.artist.picUrl)
+                    }
+
+                    // Non-NetEase LX sources expose artist names but often
+                    // omit a portrait. Resolve only the metadata card, never
+                    // the track itself, so the chosen source remains intact.
+                    let result = try? await NeteaseAPI.search(target.name, type: .artists, limit: 5)
+                    let match = result?.artists?.first {
+                        $0.name.localizedCaseInsensitiveCompare(target.name) == .orderedSame
+                    } ?? result?.artists?.first
+                    return (target.id, match?.picUrl)
+                }
+            }
+
+            var values: [(String, String?)] = []
+            for await value in group {
+                values.append(value)
+            }
+            return values
+        }
+
+        guard generation == requestGeneration else { return }
+        for (key, avatarURL) in responses {
+            if let avatarURL, !avatarURL.isEmpty {
+                artistAvatarCache[key] = avatarURL
+            }
+        }
+        applyCachedArtistAvatars()
+    }
+
+    private func applyCachedArtistAvatars() {
+        artists = artists.map { artist in
+            var updated = artist
+            if let avatarURL = artistAvatarCache[artist.id] {
+                updated.avatarURL = avatarURL
+            }
+            return updated
+        }
+    }
+}
+
+/// Leading magnifying glass in secondary colour with a fixed-width slot, so
+/// suggestion text lines up with the separator inset.
+private struct SearchSuggestionLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 12) {
+            configuration.icon
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            configuration.title
+                .font(.body)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
+    }
+}
+
+struct SearchView: View {
+    @StateObject private var model: SearchViewModel
+    @StateObject private var history = SearchHistoryStore.shared
+    @State private var searchText: String = ""
+    @State private var searchDebounceTask: Task<Void, Never>?
+
+    init(query: String) {
+        _model = StateObject(wrappedValue: SearchViewModel(query: query))
+        _searchText = State(initialValue: query)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    platformPicker
+                    tabPicker
+
+                    if !model.hasAttemptedSearch || (model.isLoading && currentEmpty) {
+                        ProgressView()
+                            .frame(maxWidth: .infinity, minHeight: 300)
+                    } else if let errorMessage = model.errorMessage, currentEmpty {
+                        searchErrorState(errorMessage)
+                    } else {
+                        tabContent
+                    }
+                } else {
+                    emptySearchPrompt
+                }
+                PlayerClearanceSpacer()
+            }
+            .padding(.top, 8)
+        }
+        // iOS owns the search-tab accessory and its Liquid Glass placement.
+        // A second safe-area field here was being composited over the tab bar
+        // until the first scroll gesture caused a layout pass.
+        #if os(iOS)
+        .searchable(text: $searchText, prompt: "搜索歌曲、歌手、专辑、歌单")
+        .onSubmit(of: .search) {
+            submitSearchAfterInputMethodCommits()
+        }
+        #endif
+        .onChange(of: searchText) { newValue in
+            model.setQuery(newValue)
+            searchDebounceTask?.cancel()
+            guard !IOSUITestMode.isEnabled else { return }
+            #if os(iOS)
+            // Keep search responsive while allowing Chinese/third-party IMEs
+            // to finish composing before the request is sent.
+            searchDebounceTask = Task { @MainActor in
+                do {
+                    try await Task.sleep(for: .milliseconds(400))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, searchText == newValue else { return }
+                if newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    await model.loadHotKeywords()
+                } else {
+                    await model.load(tab: model.tab)
+                }
+            }
+            #endif
+        }
+        .navigationTitle(searchText.isEmpty ? "搜索" : searchText)
+        .task(id: searchContextTaskID) {
+            searchDebounceTask?.cancel()
+            guard !IOSUITestMode.isEnabled else { return }
+            if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                await model.loadHotKeywords()
+            } else {
+                await model.load(tab: model.tab)
+            }
+        }
+        .onDisappear {
+            searchDebounceTask?.cancel()
+            searchDebounceTask = nil
+            resignSearchInput()
+        }
+    }
+
+    private func performSearch(_ submittedText: String? = nil) {
+        let query = (submittedText ?? searchText).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        searchText = query
+        resignSearchInput()
+        history.add(query)
+        model.setQuery(query)
+        guard !IOSUITestMode.isEnabled else { return }
+        Task { await model.load(tab: model.tab, force: true) }
+    }
+
+    private var searchContextTaskID: String {
+        #if os(iOS)
+        "\(model.tab.rawValue)-\(model.platform.rawValue)"
+        #else
+        "\(model.tab.rawValue)-\(model.platform.rawValue)-\(searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)"
+        #endif
+    }
+
+    /// Some third-party IMEs submit before SwiftUI has copied marked text into
+    /// the binding. Waiting one main-loop turn lets Chinese composition commit.
+    private func submitSearchAfterInputMethodCommits() {
+        Task { @MainActor in
+            await Task.yield()
+            performSearch()
+        }
+    }
+
+    private var tabPicker: some View {
+        Picker("搜索类型", selection: $model.tab) {
+            ForEach(SearchViewModel.Tab.allCases) { tab in
+                Text(tab.rawValue).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .padding(.horizontal, Theme.Layout.contentInset)
+    }
+
+    private var platformPicker: some View {
+        // One row of scope chips, like the system search scope bar. The
+        // selected chip itself shows the platform; no separate caption row.
+        VStack(alignment: .leading, spacing: 8) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(LXCatalogPlatform.catalogueCases) { platform in
+                        Button {
+                            model.setPlatform(platform)
+                            resignSearchInput()
+                        } label: {
+                            Text(platform.displayName)
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(
+                                model.platform == platform
+                                    ? Color.primary
+                                    : Color.secondary.opacity(0.14),
+                                in: Capsule()
+                            )
+                            .foregroundStyle(model.platform == platform
+                                             ? Platform.windowBackgroundColor : .primary)
+                            .frame(minHeight: 44)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(model.platform == platform ? .isSelected : [])
+                    }
+                }
+            }
+            .contentMargins(.horizontal, Theme.Layout.contentInset, for: .scrollContent)
+        }
+    }
+
+    private func searchErrorState(_ message: String) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 34, weight: .medium))
+                .foregroundStyle(Theme.accent)
+            Text("搜索暂时不可用")
+                .font(.headline)
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("重新搜索") {
+                Task { await model.load(tab: model.tab, force: true) }
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: .infinity, minHeight: 300)
+        .padding(.horizontal, Theme.Layout.contentInset)
+    }
+
+    /// Search landing page: recent searches as a plain list, then trending
+    /// searches. No category tiles; section titles use one bold style.
+    private var emptySearchPrompt: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            if !history.entries.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("最近搜索")
+                            .font(.title3.weight(.bold))
+                        Spacer()
+                        Button("清除") { history.clear() }
+                            .font(.body)
+                            .tint(Theme.accent)
+                    }
+                    .padding(.bottom, 4)
+
+                    ForEach(Array(history.entries.prefix(6).enumerated()), id: \.element) { index, item in
+                        HStack(spacing: 12) {
+                            Button {
+                                searchText = item
+                                performSearch(item)
+                            } label: {
+                                Label(item, systemImage: "magnifyingglass")
+                                    .labelStyle(SearchSuggestionLabelStyle())
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .frame(minHeight: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                history.remove(item)
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                                    .frame(width: 44, height: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("删除搜索记录：\(item)")
+                        }
+                        if index < min(history.entries.count, 6) - 1 {
+                            Divider().padding(.leading, 30)
+                        }
+                    }
+                }
+            }
+
+            // Trending is always titled; while it loads (or a platform has
+            // none) a quiet line says so instead of leaving the page empty.
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("热门搜索")
+                        .font(.title3.weight(.bold))
+                    Spacer()
+                    Text(model.platform.displayName)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.bottom, 4)
+
+                if model.hotKeywords.isEmpty {
+                    Text("暂无热门搜索，输入关键词开始搜索")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(minHeight: 44, alignment: .leading)
+                } else {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(model.hotKeywords.enumerated()), id: \.offset) { index, keyword in
+                            Button {
+                                performSearch(keyword)
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Text("\(index + 1)")
+                                        .font(.body.monospacedDigit().weight(.semibold))
+                                        .foregroundStyle(index < 3 ? Theme.accent : Theme.ColorToken.secondaryText)
+                                        .frame(width: 26, alignment: .leading)
+                                    Text(keyword)
+                                        .font(.body)
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .frame(minHeight: 44)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("第\(index + 1)名，\(keyword)")
+                            if index < model.hotKeywords.count - 1 {
+                                Divider().padding(.leading, 38)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, Theme.Layout.contentInset)
+    }
+
+    private var currentEmpty: Bool {
+        switch model.tab {
+        case .all: return model.songs.isEmpty && model.artists.isEmpty && model.albums.isEmpty && model.playlists.isEmpty
+        case .songs: return model.songs.isEmpty
+        case .artists: return model.artists.isEmpty
+        case .albums: return model.albums.isEmpty
+        case .playlists: return model.playlists.isEmpty
+        }
+    }
+
+    @ViewBuilder
+    private var tabContent: some View {
+        switch model.tab {
+        case .all:
+            if !model.songs.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    SectionHeader(title: "单曲") { model.tab = .songs }
+                        .padding(.horizontal, Theme.Layout.contentInset)
+                    TrackListView(tracks: Array(model.songs.prefix(6)), showsSummary: false)
+                        .padding(.horizontal, Theme.Layout.contentInset - 10)
+                }
+            }
+            if !model.artists.isEmpty {
+                Shelf(title: "歌手", seeAll: { model.tab = .artists }) {
+                    artistCards(model.artists.prefix(8))
+                }
+            }
+            if !model.albums.isEmpty {
+                Shelf(title: "专辑", seeAll: { model.tab = .albums }) {
+                    albumCards(model.albums.prefix(8))
+                }
+            }
+            if !model.playlists.isEmpty {
+                Shelf(title: "歌单", seeAll: { model.tab = .playlists }) {
+                    playlistCards(model.playlists.prefix(8))
+                }
+            }
+            if currentEmpty, !model.isLoading {
+                EmptyStateView(icon: "magnifyingglass", title: "没有找到相关结果")
+                    .frame(minHeight: 300)
+            }
+        case .songs:
+            TrackListView(tracks: model.songs)
+                .padding(.horizontal, Theme.Layout.contentInset - 10)
+        case .artists:
+            CardGrid(minWidth: 140) {
+                artistCards(model.artists)
+            }
+            .padding(.horizontal, Theme.Layout.contentInset)
+        case .albums:
+            CardGrid {
+                albumCards(model.albums)
+            }
+            .padding(.horizontal, Theme.Layout.contentInset)
+        case .playlists:
+            CardGrid {
+                playlistCards(model.playlists)
+            }
+            .padding(.horizontal, Theme.Layout.contentInset)
+        }
+    }
+
+    private func artistCards(_ items: some Collection<SearchViewModel.ArtistResult>) -> some View {
+        ForEach(Array(items)) { artist in
+            if let neteaseID = artist.neteaseID {
+                NavigationLink(value: Destination.artist(neteaseID)) {
+                    artistCard(artist)
+                }
+                .buttonStyle(.plain)
+            } else {
+                NavigationLink(value: Destination.lxArtist(
+                    source: artist.source,
+                    name: artist.name,
+                    avatarURL: artist.avatarURL
+                )) {
+                    artistCard(artist)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func artistCard(_ artist: SearchViewModel.ArtistResult) -> some View {
+        VStack(spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(.quaternary.opacity(0.35))
+                if let url = artist.avatarURL?.resizedImageURL(384) {
+                    CachedAsyncImage(url: url) {
+                        Image(systemName: "person.crop.circle")
+                            .font(.system(size: 52, weight: .light))
+                            .foregroundStyle(.secondary)
+                    }
+                    .clipShape(Circle())
+                } else {
+                    Image(systemName: "person.crop.circle")
+                        .font(.system(size: 52, weight: .light))
+                        .foregroundStyle(.secondary)
+                }
+            }
+                .frame(width: 128, height: 128)
+                .overlay(Circle().stroke(.white.opacity(0.16), lineWidth: 1))
+            Text(artist.name)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
+        .frame(width: 140)
+        .contentShape(Rectangle())
+    }
+
+    private func resignSearchInput() {
+        #if os(iOS)
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder),
+            to: nil,
+            from: nil,
+            for: nil
+        )
+        DispatchQueue.main.async {
+            UIApplication.shared.sendAction(
+                #selector(UIResponder.resignFirstResponder),
+                to: nil,
+                from: nil,
+                for: nil
+            )
+        }
+        #endif
+    }
+
+    private func albumCards(_ items: some Collection<SearchViewModel.AlbumResult>) -> some View {
+        ForEach(Array(items)) { album in
+            if let neteaseID = album.neteaseID {
+                NavigationLink(value: Destination.album(neteaseID)) {
+                    albumCard(album)
+                }
+                .buttonStyle(.plain)
+            } else {
+                NavigationLink(value: Destination.lxAlbum(
+                    source: album.source,
+                    id: album.sourceID,
+                    name: album.name,
+                    artistName: album.artistName,
+                    coverURL: album.coverURL
+                )) {
+                    albumCard(album)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func albumCard(_ album: SearchViewModel.AlbumResult) -> some View {
+        CoverCardBody(
+            coverURL: album.coverURL?.resizedImageURL(384),
+            title: album.name,
+            subtitle: album.artistName
+        )
+    }
+
+    private func playlistCards(_ items: some Collection<LXPlaylistSummary>) -> some View {
+        ForEach(Array(items)) { playlist in
+            NavigationLink(value: Destination.lxPlaylist(source: playlist.source, id: playlist.id)) {
+                CoverCardBody(
+                    coverURL: playlist.coverURL?.resizedImageURL(384),
+                    title: playlist.name,
+                    subtitle: [playlist.source.displayName, playlist.author].compactMap { $0 }.joined(separator: " · "),
+                    playCount: playlist.playCount
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+private struct SearchSkeletonRow: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(.quaternary)
+                .frame(width: 44, height: 44)
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(.quaternary)
+                .frame(height: 14)
+            Spacer()
+        }
+        .redacted(reason: .placeholder)
+        .frame(maxWidth: .infinity, minHeight: 50)
+    }
+}

@@ -1,0 +1,888 @@
+import SwiftUI
+
+enum TrackRowStyle {
+    /// Artwork + album column (playlists, search, daily).
+    case full
+    /// Track number, no artwork (album pages).
+    case albumTrack
+    /// Compact with artwork, no album column (artist hot songs, panels).
+    case compact
+}
+
+// MARK: - Row
+
+struct TrackRow: View {
+    let track: Track
+    let index: Int
+    var style: TrackRowStyle = .full
+    var playability: TrackPlayability = .playable
+    /// Extra trailing text (e.g. play count for recents).
+    var trailingText: String?
+    /// Set when the row lives inside a user's own playlist (enables 删除).
+    var removableFromPlaylistID: Int?
+    var onRemoved: (() -> Void)?
+    /// Hairline under the text column, inset like system list separators.
+    var showsSeparator = false
+    let onPlay: () -> Void
+
+    @EnvironmentObject private var player: PlayerService
+    @EnvironmentObject private var account: AccountStore
+    @ObservedObject private var localLibrary = LocalPlaylistStore.shared
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @ScaledMetric(relativeTo: .body) private var compactArtworkSize: CGFloat = 48
+    @ScaledMetric(relativeTo: .body) private var compactRowHeight: CGFloat = 62
+    @ScaledMetric(relativeTo: .body) private var compactAlbumRowHeight: CGFloat = 50
+    @ScaledMetric(relativeTo: .body) private var regularRowHeight: CGFloat = 52
+    @ScaledMetric(relativeTo: .body) private var regularAlbumRowHeight: CGFloat = 46
+    @State private var isHovering = false
+    @State private var showAddToPlaylist = false
+    #if os(iOS)
+    @ObservedObject private var lxStore = LXSourceStore.shared
+    #endif
+
+    private var isCurrent: Bool { player.currentTrack?.playbackKey == track.playbackKey }
+    private var isPlayable: Bool { playability == .playable }
+    private var showsArtwork: Bool { style != .albumTrack }
+    private var showsVIPBadge: Bool {
+        #if os(iOS)
+        return lxStore.selectedSource == nil && track.fee == 1
+        #else
+        return track.fee == 1
+        #endif
+    }
+
+    private var hidesLeadingIndex: Bool {
+        #if os(iOS)
+        return isCompact && showsArtwork
+        #else
+        return false
+        #endif
+    }
+
+    private var isCompact: Bool {
+        #if os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .phone || horizontalSizeClass == .compact
+        #else
+        return false
+        #endif
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if !hidesLeadingIndex {
+                leadingIndicator
+            }
+
+            if showsArtwork {
+                artwork
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(track.name)
+                        .font(isCompact ? Font.body : Font.subheadline.weight(.medium))
+                        .foregroundStyle(isCurrent ? Theme.accent : .primary)
+                        .lineLimit(1)
+                    if let subtitle = track.subtitle, !isCompact {
+                        Text("(\(subtitle))")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                    if showsVIPBadge {
+                        VIPBadge()
+                    }
+                }
+                // Two lines like the system song row. Source and quality live
+                // in the player and the row menu, not under every song.
+                Text(track.artistNames)
+                    .font(isCompact ? Font.subheadline : Font.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if style == .full && !isCompact {
+                Text(track.album.name)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: 220, alignment: .leading)
+            }
+
+            if let reason = playability.reason {
+                Text(reason)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 4))
+            }
+
+            if let trailingText {
+                Text(trailingText)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+
+            if isCompact {
+                rowMenu
+            } else {
+                likeAndDuration
+            }
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, isCompact ? 0 : 10)
+        .padding(.vertical, isCompact ? 6 : 5)
+        // Fixed row height keeps lazy-stack height estimation exact,
+        // preventing scroll-offset jumps in long lists (#3).
+        .frame(height: rowHeight)
+        .overlay(alignment: .bottom) {
+            if showsSeparator {
+                Divider().padding(.leading, separatorLeadingInset)
+            }
+        }
+        .opacity(isPlayable ? 1 : 0.45)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
+                .fill(isHovering ? Color.primary.opacity(0.06) : .clear)
+        )
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            withAnimation(AppAnimation.quick) { isHovering = hovering }
+        }
+        #if os(macOS)
+        .onTapGesture(count: 2) {
+            if isPlayable { onPlay() }
+        }
+        #else
+        .onTapGesture {
+            if isPlayable { onPlay() }
+        }
+        #endif
+        #if os(iOS)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button {
+                player.addToPlayNext(track)
+            } label: {
+                Label("下一首播放", systemImage: "text.line.first.and.arrowtriangle.forward")
+            }
+            .tint(Theme.accent)
+            Button {
+                localLibrary.toggleFavorite(track)
+            } label: {
+                Label(localLibrary.isFavorite(track) ? "取消收藏" : "收藏",
+                      systemImage: localLibrary.isFavorite(track) ? "star.slash" : "star.fill")
+            }
+            .tint(.orange)
+        }
+        #endif
+        .contextMenu { contextMenuItems }
+        .sheet(isPresented: $showAddToPlaylist) {
+            AddToPlaylistSheet(track: track)
+        }
+    }
+
+    @ViewBuilder
+    private var artwork: some View {
+        if isCompact {
+            CachedAsyncImage(url: track.album.picUrl?.resizedImageURL(160), animated: false)
+                .frame(width: compactArtworkSize, height: compactArtworkSize)
+                .overlay(alignment: .bottomTrailing) {
+                    if hidesLeadingIndex, isCurrent {
+                        PlayingIndicator(animating: player.isPlaying && !player.showNowPlaying)
+                            .padding(5)
+                            .background(
+                                .ultraThinMaterial,
+                                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            )
+                            .padding(4)
+                    }
+                }
+                .compositingGroup()
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
+        } else {
+            CachedAsyncImage(url: track.album.picUrl?.resizedImageURL(96), animated: false)
+                .frame(width: 42, height: 42)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
+        }
+    }
+
+    private var rowHeight: CGFloat {
+        if style == .albumTrack {
+            return isCompact ? compactAlbumRowHeight : regularAlbumRowHeight
+        }
+        return isCompact ? compactRowHeight : regularRowHeight
+    }
+
+    /// Separators start under the title, not under the artwork.
+    private var separatorLeadingInset: CGFloat {
+        var inset: CGFloat = 10
+        if !hidesLeadingIndex { inset += 28 + 12 }
+        if showsArtwork { inset += (isCompact ? compactArtworkSize : 42) + 12 }
+        return inset
+    }
+
+    /// Trailing "⋯" like the system song row. It carries the same actions
+    /// as the long-press menu, plus the source/quality detail removed from
+    /// the row itself.
+    private var rowMenu: some View {
+        Menu {
+            contextMenuItems
+            Divider()
+            Text("来源：\(sourceName) · 音质：\(qualityName)")
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("更多操作：\(track.name)")
+    }
+
+    @ViewBuilder
+    private var leadingIndicator: some View {
+        ZStack {
+            if isCurrent {
+                PlayingIndicator(animating: player.isPlaying && !player.showNowPlaying)
+            } else if isHovering, isPlayable {
+                Button(action: onPlay) {
+                    Image(systemName: "play.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.primary)
+                }
+                .buttonStyle(.pressable)
+            } else {
+                Text(String(index))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(width: 28)
+    }
+
+    private var likeAndDuration: some View {
+        HStack(spacing: 8) {
+            Text(Formatters.duration(track.duration))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .frame(width: 36, alignment: .trailing)
+        }
+    }
+
+    private var sourceName: String {
+        LXCatalogPlatform.displayName(for: track.source ?? track.sourceMetadata["source"])
+    }
+
+    private var qualityName: String {
+        if isCurrent {
+            if let served = player.servedQuality {
+                return AudioQuality(lxType: served)?.sourceDisplayName ?? served.uppercased()
+            }
+            return player.isResolvingSource ? "检测中" : "音质未知"
+        }
+        // A global playback preference is only a request. For queued tracks,
+        // catalogue metadata can provide a conservative available-tier hint.
+        for lxType in ["flac24bit", "flac", "320k", "128k"]
+            where hasQualitySize(lxType) {
+            return AudioQuality(lxType: lxType)?.sourceDisplayName ?? lxType
+        }
+        return "待检测"
+    }
+
+    private func hasQualitySize(_ lxType: String) -> Bool {
+        guard let raw = track.sourceMetadata["lx.quality.\(lxType).size"] else { return false }
+        let numeric = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .prefix { $0.isNumber || $0 == "." }
+        guard let value = Double(String(numeric)) else { return false }
+        return value > 0
+    }
+
+    @ViewBuilder
+    private var contextMenuItems: some View {
+        Button("播放") { onPlay() }
+        Button("下一首播放") {
+            player.addToPlayNext(track)
+        }
+        Button(localLibrary.isFavorite(track) ? "取消收藏" : "加入我喜欢的音乐") {
+            localLibrary.toggleFavorite(track)
+        }
+        Divider()
+        Button("收藏到歌单…") {
+            showAddToPlaylist = true
+        }
+        if onRemoved != nil {
+            Button("从本地歌单中删除", role: .destructive) {
+                onRemoved?()
+                ToastCenter.shared.show(String(localized: "已从歌单中删除"))
+            }
+        }
+        Divider()
+        Button("复制歌曲信息") {
+            Platform.copyToPasteboard(string: "\(track.name) - \(track.artistNames)")
+            ToastCenter.shared.show(String(localized: "歌曲信息已复制"))
+        }
+    }
+}
+
+// MARK: - Playing indicator
+
+/// The four bars beside the row that's playing.
+///
+/// Deliberately not a SwiftUI animation. Driving these from `TimelineView` —
+/// as this did for a long time — makes SwiftUI re-evaluate and re-lay-out the
+/// enclosing tree on every tick, and with the now-playing page presented as an
+/// overlay that tree is the entire window. Profiling put the cost at roughly
+/// 30% of a core, for four 14pt bars.
+///
+/// Scaling plain `CALayer`s instead is a compositing change: no `draw`, no
+/// layout invalidation, nothing above it in the tree ever learns a frame
+/// happened.
+struct PlayingIndicator: View {
+    var animating: Bool
+    @ObservedObject private var renderingBudget = RenderingBudget.shared
+
+    var body: some View {
+        SpectrumBars(
+            animating: animating
+                && !Platform.isReduceMotionEnabled
+                && renderingBudget.isSceneActive
+                && renderingBudget.allowsContinuousEffects,
+            minimumInterval: renderingBudget.minimumAnimationInterval
+        )
+            .frame(width: SpectrumBarsView.width, height: SpectrumBarsView.maxHeight)
+    }
+}
+
+#if os(macOS)
+private struct SpectrumBars: NSViewRepresentable {
+    var animating: Bool
+    var minimumInterval: TimeInterval
+    func makeNSView(context: Context) -> SpectrumBarsView {
+        let view = SpectrumBarsView()
+        view.minimumInterval = minimumInterval
+        return view
+    }
+    func updateNSView(_ view: SpectrumBarsView, context: Context) {
+        view.minimumInterval = minimumInterval
+        view.animating = animating
+    }
+    static func dismantleNSView(_ view: SpectrumBarsView, coordinator: ()) {
+        view.animating = false
+    }
+}
+#else
+private struct SpectrumBars: UIViewRepresentable {
+    var animating: Bool
+    var minimumInterval: TimeInterval
+    func makeUIView(context: Context) -> SpectrumBarsView {
+        let view = SpectrumBarsView()
+        view.minimumInterval = minimumInterval
+        return view
+    }
+    func updateUIView(_ view: SpectrumBarsView, context: Context) {
+        view.minimumInterval = minimumInterval
+        view.animating = animating
+    }
+    static func dismantleUIView(_ view: SpectrumBarsView, coordinator: ()) {
+        view.animating = false
+    }
+}
+#endif
+
+final class SpectrumBarsView: PlatformView {
+    static let minHeight: CGFloat = 3
+    static let maxHeight: CGFloat = 14
+    static let barWidth: CGFloat = 2.5
+    static let spacing: CGFloat = 2
+    static let width =
+        CGFloat(AudioSpectrum.bandCount) * barWidth
+        + CGFloat(AudioSpectrum.bandCount - 1) * spacing
+
+    private var bars: [CALayer] = []
+    private var timer: Timer?
+    private var startedAt = CACurrentMediaTime()
+    var minimumInterval: TimeInterval = 1.0 / 30.0 {
+        didSet {
+            guard minimumInterval != oldValue, animating else { return }
+            timer?.invalidate()
+            timer = nil
+            start()
+        }
+    }
+
+    var animating = false {
+        didSet {
+            guard animating != oldValue else { return }
+            animating ? start() : stop()
+        }
+    }
+
+    init() {
+        super.init(frame: CGRect(x: 0, y: 0, width: Self.width, height: Self.maxHeight))
+        #if os(macOS)
+        wantsLayer = true
+        #endif
+        buildBars()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    deinit { timer?.invalidate() }
+
+    /// `NSView.layer` is optional; `UIView.layer` is not.
+    private var hostLayer: CALayer? { layer }
+
+    private func buildBars() {
+        guard let host = hostLayer else { return }
+        let color = PlatformColor(Theme.accent).cgColor
+        for _ in 0..<AudioSpectrum.bandCount {
+            let bar = CALayer()
+            bar.backgroundColor = color
+            bar.cornerRadius = 1
+            // Centered anchor so a scale grows the bar symmetrically.
+            bar.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+            bar.bounds = CGRect(x: 0, y: 0, width: Self.barWidth, height: Self.maxHeight)
+            host.addSublayer(bar)
+            bars.append(bar)
+        }
+        apply(scaleForAll: Self.minHeight / Self.maxHeight)
+    }
+
+    #if os(macOS)
+    override func layout() {
+        super.layout()
+        positionBars()
+    }
+    #else
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        positionBars()
+    }
+    #endif
+
+    private func positionBars() {
+        for (i, bar) in bars.enumerated() {
+            bar.position = CGPoint(
+                x: CGFloat(i) * (Self.barWidth + Self.spacing) + Self.barWidth / 2,
+                y: bounds.midY)
+        }
+    }
+
+    // Energy: a playing row in an unselected tab or a pushed-under page is
+    // off-window; its 24 Hz timer would otherwise keep running unseen.
+    #if os(macOS)
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        windowAvailabilityChanged(window != nil)
+    }
+    #else
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        windowAvailabilityChanged(window != nil)
+    }
+    #endif
+
+    private func windowAvailabilityChanged(_ inWindow: Bool) {
+        if inWindow {
+            if animating { start() }
+        } else if timer != nil {
+            timer?.invalidate()
+            timer = nil
+        }
+    }
+
+    private func start() {
+        guard timer == nil, window != nil else { return }
+        startedAt = CACurrentMediaTime()
+        // Common mode so the bars keep moving while a list is being scrolled.
+        let timer = Timer(timeInterval: minimumInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func stop() {
+        timer?.invalidate()
+        timer = nil
+        apply(scaleForAll: Self.minHeight / Self.maxHeight)
+    }
+
+    @MainActor
+    private func tick() {
+        let spectrum = AudioSpectrum.shared
+        let live: Bool
+        switch spectrum.tapState {
+        case .tapped:
+            // Samples may still be a few hundred milliseconds out while the
+            // source buffers. Hold still through that rather than animating,
+            // which reads as a glitch right as a song starts.
+            live = spectrum.isLive
+            guard live else {
+                apply(scaleForAll: Self.minHeight / Self.maxHeight)
+                return
+            }
+        case .untappable:
+            live = false
+        case .idle, .preparing:
+            // Not yet known whether this source can be tapped.
+            apply(scaleForAll: Self.minHeight / Self.maxHeight)
+            return
+        }
+
+        let elapsed = CACurrentMediaTime() - startedAt
+        let span = Self.maxHeight - Self.minHeight
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (i, bar) in bars.enumerated() {
+            // Real band levels when the tap is feeding us; otherwise the old
+            // decorative sine, so untappable sources still look alive.
+            let level = live
+                ? CGFloat(spectrum.level(at: i))
+                : CGFloat(abs(sin(elapsed * 2.4 + Double(i) * 0.9)))
+            let height = Self.minHeight + span * level
+            bar.transform = CATransform3DMakeScale(1, height / Self.maxHeight, 1)
+        }
+        CATransaction.commit()
+    }
+
+    private func apply(scaleForAll scale: CGFloat) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for bar in bars {
+            bar.transform = CATransform3DMakeScale(1, scale, 1)
+        }
+        CATransaction.commit()
+    }
+}
+
+// MARK: - Track list
+
+struct TrackListView: View {
+    let tracks: [Track]
+    var style: TrackRowStyle = .full
+    var privileges: [Int: TrackPrivilege] = [:]
+    var source: PlaySource = .none
+    /// The place this list belongs to, for the Dock menu's recents.
+    var context: PlayContext?
+    var removableFromPlaylistID: Int?
+    var onRemoved: ((Track) -> Void)?
+    /// Optional selection binding used by local-playlist batch actions.
+    /// Existing callers stay in the normal, non-selectable mode.
+    var selectedTrackKeys: Binding<Set<String>>? = nil
+    var showsSeparators = true
+    /// Footer with song count and total length; for playlist/album pages,
+    /// not for short song shelves inside feeds.
+    var showsSummary = true
+
+    @EnvironmentObject private var player: PlayerService
+    @EnvironmentObject private var account: AccountStore
+    #if os(iOS)
+    @ObservedObject private var lxStore = LXSourceStore.shared
+    #endif
+
+    var body: some View {
+        VStack(spacing: 4) {
+            LazyVStack(spacing: 0) {
+            ForEach(Array(tracks.enumerated()), id: \.element.playbackKey) { index, track in
+                HStack(spacing: 6) {
+                    if let selection = selectedTrackKeys {
+                        Button {
+                            var keys = selection.wrappedValue
+                            let key = track.playbackKey
+                            if keys.contains(key) {
+                                keys.remove(key)
+                            } else {
+                                keys.insert(key)
+                            }
+                            selection.wrappedValue = keys
+                        } label: {
+                            Image(systemName: selection.wrappedValue.contains(track.playbackKey)
+                                  ? "checkmark.circle.fill" : "circle")
+                                .font(.title3)
+                                .foregroundStyle(selection.wrappedValue.contains(track.playbackKey)
+                                                 ? Theme.accent : .secondary)
+                                .frame(width: 44, height: 44)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(selection.wrappedValue.contains(track.playbackKey)
+                                            ? "取消选择 \(track.name)" : "选择 \(track.name)")
+                    }
+
+                    TrackRow(
+                        track: track,
+                        index: style == .albumTrack ? (track.trackNo > 0 ? track.trackNo : index + 1) : index + 1,
+                        style: style,
+                        playability: playability(of: track),
+                        removableFromPlaylistID: removableFromPlaylistID,
+                        onRemoved: { onRemoved?(track) },
+                        showsSeparator: showsSeparators && index < tracks.count - 1
+                    ) {
+                        player.play(tracks: playableTracks, source: source, startAt: track,
+                                    context: context)
+                    }
+                }
+            }
+            }
+
+            #if os(iOS)
+            // Count summary sits under the list, like the system footer
+            // "24 首歌曲，1 小时 20 分钟".
+            if showsSummary, tracks.count > 1 {
+                Text(trackSummary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 12)
+            }
+            #endif
+        }
+    }
+
+    private var trackSummary: String {
+        let totalMinutes = tracks.reduce(0) { $0 + $1.duration } / 60
+        guard totalMinutes >= 1 else { return "\(tracks.count) 首歌曲" }
+        let hours = Int(totalMinutes) / 60
+        let minutes = Int(totalMinutes) % 60
+        let length = hours > 0 ? "\(hours) 小时 \(minutes) 分钟" : "\(minutes) 分钟"
+        return "\(tracks.count) 首歌曲，\(length)"
+    }
+
+    private var playableTracks: [Track] {
+        tracks.filter { playability(of: $0) == .playable }
+    }
+
+    private func playability(of track: Track) -> TrackPlayability {
+        #if os(iOS)
+        // NetEase catalogue metadata can mark a track as VIP-only even when
+        // the selected LX source can resolve its public playback URL.
+        if lxStore.selectedSource != nil { return .playable }
+        #endif
+        // With unblock enabled, gray tracks resolve from third-party sources.
+        if SettingsManager.shared.enableUnblock { return .playable }
+        return track.playability(
+            privilege: privileges[track.id],
+            isLoggedIn: account.isLoggedIn,
+            vipType: account.vipType
+        )
+    }
+}
+
+// MARK: - Add to playlist
+
+/// The system "add to playlist" sheet pattern: a full-height navigation sheet
+/// with a New Playlist row and the library's playlists with their artwork.
+/// Each row toggles: a tap saves the selection to that list (at the top) and
+/// shows a checkmark, a second tap takes it out again. The sheet stays open so
+/// several lists can be changed; a search field filters them by name.
+struct AddToPlaylistSheet: View {
+    /// Pinned when the sheet opens: toggling must not change what is being
+    /// saved, even if the presenter's selection changes underneath it.
+    @State private var tracks: [Track]
+    /// The playlist the songs come from. It is left out, so a tap can never
+    /// strip songs from the list being copied.
+    private let excludedPlaylistID: UUID?
+
+    init(track: Track) {
+        _tracks = State(initialValue: [track])
+        excludedPlaylistID = nil
+    }
+
+    init(tracks: [Track], excludingPlaylist excludedPlaylistID: UUID? = nil) {
+        _tracks = State(initialValue: tracks)
+        self.excludedPlaylistID = excludedPlaylistID
+    }
+
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var localStore = LocalPlaylistStore.shared
+    @State private var query = ""
+    @State private var showCreate = false
+    @State private var newName = ""
+    /// Bumped on every row toggle, for the selection haptic.
+    @State private var toggleCount = 0
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Button {
+                        newName = ""
+                        showCreate = true
+                    } label: {
+                        newPlaylistRow
+                    }
+                    .accessibilityIdentifier("addToPlaylistNewPlaylist")
+
+                    ForEach(filteredPlaylists) { playlist in
+                        let saved = isSaved(in: playlist)
+                        Button {
+                            toggle(playlist, saved: saved)
+                        } label: {
+                            playlistRow(playlist, saved: saved)
+                        }
+                        .accessibilityAddTraits(saved ? .isSelected : [])
+                        .accessibilityHint(saved ? Text("从此歌单移除") : Text("添加到此歌单"))
+                    }
+
+                    if !query.isEmpty && filteredPlaylists.isEmpty {
+                        Text("没有找到“\(query)”")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .listRowSeparator(.hidden)
+                    }
+                } footer: {
+                    if query.isEmpty && filteredPlaylists.isEmpty {
+                        Text(tracks.count == 1
+                             ? "还没有歌单。新建一个，这首歌会直接存进去。"
+                             : "还没有歌单。新建一个，这些歌曲会直接存进去。")
+                    }
+                }
+                // Nothing to save (an empty playlist with no selection).
+                .disabled(tracks.isEmpty)
+            }
+            .listStyle(.plain)
+            .navigationTitle("收藏到歌单")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(
+                text: $query,
+                placement: .navigationBarDrawer(displayMode: .automatic),
+                prompt: "搜索歌单"
+            )
+            #endif
+            .toolbar {
+                // Changes apply as rows are tapped, so this only closes.
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                        .accessibilityIdentifier("addToPlaylistDone")
+                }
+            }
+            .sensoryFeedback(.selection, trigger: toggleCount)
+            .alert("新建歌单", isPresented: $showCreate) {
+                TextField("歌单名称", text: $newName)
+                Button("创建") { createAndAdd() }
+                    .disabled(trimmedNewName.isEmpty)
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text(tracks.count == 1 ? "这首歌会添加到新歌单。" : "这些歌曲会添加到新歌单。")
+            }
+        }
+        #if os(iOS)
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+        #else
+        .frame(width: 380, height: 520)
+        #endif
+    }
+
+    // MARK: Rows
+
+    private var newPlaylistRow: some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
+                .fill(Theme.ColorToken.controlFill)
+                .frame(width: 56, height: 56)
+                .overlay {
+                    Image(systemName: "plus")
+                        .font(.title2.weight(.medium))
+                        .foregroundStyle(Theme.accent)
+                }
+            Text("新建歌单…")
+                .font(.body)
+                .foregroundStyle(Theme.accent)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+    }
+
+    private func playlistRow(_ playlist: LocalPlaylist, saved: Bool) -> some View {
+        HStack(spacing: 12) {
+            artwork(url: playlist.coverURL, size: 56, placeholder: "music.note.list")
+            VStack(alignment: .leading, spacing: 3) {
+                Text(playlist.name)
+                    .font(.body)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text("\(playlist.tracks.count) 首")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            if saved {
+                Image(systemName: "checkmark")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(Theme.accent)
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+    }
+
+    private func artwork(url: String?, size: CGFloat, placeholder: String) -> some View {
+        CachedAsyncImage(url: url?.resizedImageURL(Int(size * 3)), animated: false)
+            .frame(width: size, height: size)
+            .background(
+                Theme.ColorToken.controlFill,
+                in: RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
+            )
+            .overlay {
+                if url == nil {
+                    Image(systemName: placeholder)
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
+                    .strokeBorder(Theme.ColorToken.subtleBorder, lineWidth: 0.5)
+            }
+            .accessibilityHidden(true)
+    }
+
+    // MARK: Data
+
+    private var filteredPlaylists: [LocalPlaylist] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return localStore.playlists.filter { playlist in
+            playlist.id != excludedPlaylistID
+                && (needle.isEmpty || playlist.name.localizedCaseInsensitiveContains(needle))
+        }
+    }
+
+    private var trimmedNewName: String {
+        newName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isSaved(in playlist: LocalPlaylist) -> Bool {
+        localStore.containsAll(tracks, in: playlist.id)
+    }
+
+    /// First tap saves (to the top of the list), second tap removes. The
+    /// checkmark is the feedback; the sheet stays open. A partly saved
+    /// multi-selection counts as not saved, so a tap completes it.
+    private func toggle(_ playlist: LocalPlaylist, saved: Bool) {
+        if saved {
+            localStore.remove(tracks, from: playlist.id)
+        } else {
+            localStore.add(tracks, to: playlist.id)
+        }
+        toggleCount += 1
+    }
+
+    private func createAndAdd() {
+        let name = trimmedNewName
+        guard !name.isEmpty, localStore.create(name: name, tracks: tracks) != nil else { return }
+        ToastCenter.shared.show("已收藏到「\(name)」")
+        dismiss()
+    }
+}

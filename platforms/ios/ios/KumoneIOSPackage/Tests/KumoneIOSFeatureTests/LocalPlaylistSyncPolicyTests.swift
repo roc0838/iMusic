@@ -1,0 +1,575 @@
+import XCTest
+@testable import KumoneCore
+
+final class LocalPlaylistSyncPolicyTests: XCTestCase {
+    func testLXSyncIncludesEveryProviderPlaylistAndPreservesIdentityAliases() {
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(LocalPlaylist(
+            name: "QQ 收藏歌单", remoteSource: "qq", remotePlaylistID: "42"
+        )))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(LocalPlaylist(
+            name: "网易云歌单", remoteSource: "netease", remotePlaylistID: "84"
+        )))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(source: "tx"))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(source: "wy"))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(LXSyncUserPlaylist(
+            id: "old-qq-copy",
+            name: "旧 QQ 收藏歌单",
+            source: "qq",
+            iMusicSourceName: "QQ 音乐"
+        )))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(LXSyncUserPlaylist(
+            id: "old-netease-copy",
+            name: "旧网易云歌单",
+            source: "netease",
+            iMusicSourceName: "网易云音乐"
+        )))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(LXSyncUserPlaylist(
+            id: "imported-qq-list-without-extra-metadata",
+            name: "QQ 链接导入歌单",
+            source: "tx",
+            iMusicSourceName: "QQ 音乐"
+        )))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(LocalPlaylist(
+            name: "QQ 链接导入歌单",
+            sourceName: "QQ 音乐",
+            remoteSource: "tx",
+            isLocalCopy: true
+        )))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(LXSyncUserPlaylist(
+            id: "lx-imported-qq-list",
+            name: "QQ 链接导入歌单",
+            source: "tx",
+            iMusicSourceName: "QQ 音乐",
+            iMusicLocalCopy: true
+        )))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(LocalPlaylist(name: "iMusic 本地歌单")))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldSyncToLX(LXSyncUserPlaylist(
+            id: "lx-catalog-copy",
+            name: "LX 兼容音源歌单",
+            source: "kw",
+            iMusicSourceName: "酷我"
+        )))
+    }
+
+    @MainActor
+    func testLegacyExcludedAccountPlaylistsAreBackedUpOnceBeforeSyncIDsAreAssigned() throws {
+        let suiteName = "LocalPlaylistLegacyLXBackupTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let legacy = LocalPlaylist(
+            name: "升级前 QQ 副本",
+            tracks: [track(id: 7, name: "保留歌曲")],
+            remoteSource: "qq",
+            remotePlaylistID: "playlist-7"
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        defaults.set(try encoder.encode([legacy]), forKey: "moumusic.localPlaylists.v1")
+
+        let store = LocalPlaylistStore(defaults: defaults)
+        let eligible = store.preparePlaylistsForLXSync()
+        let backup = store.legacyLXSyncPlaylistBackup()
+        _ = store.preparePlaylistsForLXSync()
+
+        XCTAssertEqual(eligible.count, 1)
+        XCTAssertEqual(eligible[0].lxSyncID, legacy.id.uuidString)
+        XCTAssertEqual(backup.map(\.id), [legacy.id])
+        XCTAssertEqual(backup.first?.remoteSource, "qq")
+        XCTAssertEqual(backup.first?.tracks.map(\.name), ["保留歌曲"])
+        XCTAssertNotNil(defaults.data(forKey: "moumusic.localPlaylists.v1.lxSyncLegacyAccountCopiesBackup.v1"))
+    }
+
+    @MainActor
+    func testFavoriteBatchRemovalPersistsOnlyUnselectedSongs() {
+        let suiteName = "LocalPlaylistSyncPolicyTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = LocalPlaylistStore(defaults: defaults)
+        let selected = track(id: 95, name: "批量删除歌曲")
+        let retained = track(id: 96, name: "保留歌曲")
+        store.toggleFavorite(selected)
+        store.toggleFavorite(retained)
+
+        let removed = store.removeFavorites(playbackKeys: [selected.playbackKey])
+
+        XCTAssertEqual(removed, 1)
+        XCTAssertEqual(store.favoriteTracks.map(\.name), ["保留歌曲"])
+    }
+
+    @MainActor
+    func testPlaylistBatchDeletionRemovesOnlySelectedPlaylists() throws {
+        let suiteName = "LocalPlaylistBatchDeleteTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = LocalPlaylistStore(defaults: defaults)
+        let first = try XCTUnwrap(store.create(name: "删除一"))
+        let second = try XCTUnwrap(store.create(name: "删除二"))
+        let retained = try XCTUnwrap(store.create(name: "保留"))
+
+        store.delete(ids: [first, second])
+
+        XCTAssertEqual(store.playlists.map(\.id), [retained])
+    }
+
+    func testEditedProviderPlaylistStopsRefreshingFromProvider() {
+        let localCopy = LocalPlaylist(
+            name: "Edited copy",
+            remoteSource: "netease",
+            remotePlaylistID: "42",
+            isLocalCopy: true
+        )
+
+        XCTAssertFalse(LocalPlaylistSyncPolicy.shouldRefreshFromProvider(localCopy))
+        XCTAssertFalse(LocalPlaylistSyncPolicy.shouldApplyProviderSnapshot(to: localCopy))
+    }
+
+    func testUneditedProviderPlaylistContinuesRefreshing() {
+        let imported = LocalPlaylist(
+            name: "Imported playlist",
+            remoteSource: "netease",
+            remotePlaylistID: "42"
+        )
+
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldRefreshFromProvider(imported))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldApplyProviderSnapshot(to: imported))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldApplyProviderSnapshot(to: nil))
+    }
+
+    func testProviderPlaylistRefreshRequiresExplicitSelection() {
+        let legacyImport = LocalPlaylist(
+            name: "旧版自动导入",
+            remoteSource: "netease",
+            remotePlaylistID: "legacy"
+        )
+        let selectedImport = LocalPlaylist(
+            name: "已选择导入",
+            remoteSource: "qq",
+            remotePlaylistID: "selected",
+            providerSyncEnabled: true
+        )
+
+        XCTAssertFalse(LocalPlaylistSyncPolicy.isProviderRefreshEnabled(legacyImport))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.isProviderRefreshEnabled(selectedImport))
+    }
+
+    func testProviderRefreshPermissionIsLocalAndIsNotGrantedByAnotherDeviceSnapshot() {
+        let optedInLocally = LocalPlaylist(
+            name: "本机已授权",
+            remoteSource: "qq",
+            remotePlaylistID: "42",
+            providerSyncEnabled: true
+        )
+        let remote = LXSyncUserPlaylist(
+            id: "stable-id",
+            name: "远端副本",
+            source: "qq",
+            sourceListId: "42"
+        )
+
+        let samePlaylist = LocalPlaylistSyncPolicy.merge(remote, with: optedInLocally)
+        let otherDevice = LocalPlaylistSyncPolicy.merge(remote, with: nil)
+
+        XCTAssertTrue(LocalPlaylistSyncPolicy.isProviderRefreshEnabled(samePlaylist))
+        XCTAssertNil(otherDevice.providerSyncEnabled)
+        XCTAssertFalse(LocalPlaylistSyncPolicy.isProviderRefreshEnabled(otherDevice))
+        XCTAssertEqual(samePlaylist.remoteSource, "qq")
+        XCTAssertEqual(samePlaylist.remotePlaylistID, "42")
+    }
+
+    func testNewOptionalProviderFlagDecodesLegacyPlaylistData() throws {
+        let oldPlaylist = LocalPlaylist(
+            name: "存量歌单",
+            remoteSource: "qq",
+            remotePlaylistID: "old"
+        )
+        let legacyEncodedData = try JSONEncoder().encode(oldPlaylist)
+        let decoded = try JSONDecoder().decode(LocalPlaylist.self, from: legacyEncodedData)
+
+        XCTAssertNil(decoded.providerSyncEnabled)
+        XCTAssertFalse(LocalPlaylistSyncPolicy.isProviderRefreshEnabled(decoded))
+    }
+
+    func testQQPlaylistCopyCanRefreshUntilItHasLocalEdits() {
+        let imported = LocalPlaylist(
+            name: "QQ copy",
+            remoteSource: "qq",
+            remotePlaylistID: "playlist-42"
+        )
+        let edited = LocalPlaylist(
+            name: "Edited QQ copy",
+            remoteSource: "qq",
+            remotePlaylistID: "playlist-42",
+            isLocalCopy: true
+        )
+
+        XCTAssertTrue(LocalPlaylistSyncPolicy.canRefreshProviderPlaylist(
+            imported,
+            source: "qq",
+            id: "playlist-42"
+        ))
+        XCTAssertFalse(LocalPlaylistSyncPolicy.canRefreshProviderPlaylist(
+            edited,
+            source: "qq",
+            id: "playlist-42"
+        ))
+        XCTAssertFalse(LocalPlaylistSyncPolicy.canApplyProviderSnapshot(
+            to: edited,
+            source: "qq",
+            id: "playlist-42"
+        ))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.canApplyProviderSnapshot(
+            to: edited,
+            source: "qq",
+            id: "playlist-42",
+            allowOverwritingLocalEdits: true
+        ))
+        XCTAssertFalse(LocalPlaylistSyncPolicy.canApplyProviderSnapshot(
+            to: edited,
+            source: "qq",
+            id: "different-playlist",
+            allowOverwritingLocalEdits: true
+        ))
+        XCTAssertFalse(LocalPlaylistSyncPolicy.canRefreshProviderPlaylist(
+            imported,
+            source: "qq",
+            id: "different-playlist"
+        ))
+    }
+
+    func testLegacyQQCopiesRequireConfirmationWhenEditHistoryIsAmbiguous() {
+        let legacyAccountImport = LocalPlaylist(
+            name: "Legacy QQ copy",
+            sourceName: "QQ 音乐",
+            remoteSource: "qq",
+            remotePlaylistID: "playlist-legacy",
+            isLocalCopy: true
+        )
+        let shareLinkCopy = LocalPlaylist(
+            name: "Legacy shared link",
+            sourceName: "QQ 音乐",
+            remoteSource: "tx",
+            remotePlaylistID: "playlist-legacy",
+            isLocalCopy: true
+        )
+
+        XCTAssertFalse(LocalPlaylistSyncPolicy.canRefreshProviderPlaylist(
+            legacyAccountImport,
+            source: "qq",
+            id: "playlist-legacy"
+        ))
+        XCTAssertFalse(LocalPlaylistSyncPolicy.canRefreshProviderPlaylist(
+            shareLinkCopy,
+            source: "qq",
+            id: "playlist-legacy"
+        ))
+    }
+
+    func testOlderLXSyncUpdateCannotClearAnEditedCopyFlag() {
+        let localCopy = LocalPlaylist(
+            name: "Edited copy",
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 2),
+            remoteSource: "netease",
+            remotePlaylistID: "42",
+            isLocalCopy: true
+        )
+
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldPreserveLocalEdits(
+            current: localCopy,
+            incomingLocalCopyFlag: nil,
+            incomingUpdateTime: 3_000
+        ))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldPreserveLocalEdits(
+            current: localCopy,
+            incomingLocalCopyFlag: false,
+            incomingUpdateTime: 3_000
+        ))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldPreserveLocalEdits(
+            current: localCopy,
+            incomingLocalCopyFlag: true,
+            incomingUpdateTime: 1_999
+        ))
+        XCTAssertFalse(LocalPlaylistSyncPolicy.shouldPreserveLocalEdits(
+            current: localCopy,
+            incomingLocalCopyFlag: true,
+            incomingUpdateTime: 3_000
+        ))
+        XCTAssertTrue(LocalPlaylistSyncPolicy.shouldPreserveLocalEdits(
+            current: localCopy,
+            incomingLocalCopyFlag: true,
+            incomingUpdateTime: nil
+        ))
+    }
+
+    func testOlderLXSyncSnapshotDoesNotReplaceEditedPlaylistContents() {
+        let editedTrack = track(id: 2, name: "Local edit")
+        let staleTrack = track(id: 1, name: "Provider version")
+        let current = LocalPlaylist(
+            name: "My edited name",
+            tracks: [editedTrack],
+            remoteSource: "netease",
+            remotePlaylistID: "42",
+            remoteRevision: 100,
+            lxSyncID: "playlist-1",
+            isLocalCopy: true
+        )
+        let olderClientSnapshot = LXSyncUserPlaylist(
+            id: "playlist-1",
+            name: "Provider playlist name",
+            source: "netease",
+            sourceListId: "42",
+            locationUpdateTime: 200,
+            list: [LXSyncMusicInfo(track: staleTrack)]
+        )
+
+        let merged = LocalPlaylistSyncPolicy.merge(olderClientSnapshot, with: current)
+
+        XCTAssertEqual(merged.name, "My edited name")
+        XCTAssertEqual(merged.tracks.map(\.name), ["Local edit"])
+        XCTAssertEqual(merged.remoteRevision, 100)
+        XCTAssertTrue(merged.isLocalCopy == true)
+    }
+
+    func testNewerFlaggedLXSyncSnapshotCanPropagateEditsFromAnotherDevice() {
+        let localTrack = track(id: 1, name: "Older local edit")
+        let newerTrack = track(id: 2, name: "Newer device edit")
+        let current = LocalPlaylist(
+            name: "Older local edit",
+            tracks: [localTrack],
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 2),
+            remoteSource: "netease",
+            remotePlaylistID: "42",
+            lxSyncID: "playlist-1",
+            isLocalCopy: true
+        )
+        let newerSnapshot = LXSyncUserPlaylist(
+            id: "playlist-1",
+            name: "Newer device edit",
+            source: "netease",
+            sourceListId: "42",
+            locationUpdateTime: 3_000,
+            list: [LXSyncMusicInfo(track: newerTrack)],
+            iMusicLocalCopy: true
+        )
+
+        let merged = LocalPlaylistSyncPolicy.merge(newerSnapshot, with: current)
+
+        XCTAssertEqual(merged.name, "Newer device edit")
+        XCTAssertEqual(merged.tracks.map(\.name), ["Newer device edit"])
+        XCTAssertTrue(merged.isLocalCopy == true)
+    }
+
+    func testProviderIdentityAllowsAccountImportToRecognizeLinkImport() {
+        let linkImportedCopy = LocalPlaylist(
+            name: "网易云歌单",
+            remoteSource: "netease",
+            remotePlaylistID: "42",
+            isLocalCopy: true
+        )
+
+        XCTAssertTrue(LocalPlaylistSyncPolicy.matchesProviderPlaylist(
+            linkImportedCopy,
+            source: "netease",
+            id: "42"
+        ))
+        XCTAssertFalse(LocalPlaylistSyncPolicy.matchesProviderPlaylist(
+            linkImportedCopy,
+            source: "netease",
+            id: "43"
+        ))
+    }
+
+    func testQQAccountImportRecognizesLXCatalogSourceAlias() {
+        let linkImportedCopy = LocalPlaylist(
+            name: "QQ 歌单",
+            remoteSource: "tx",
+            remotePlaylistID: "playlist-42",
+            isLocalCopy: true
+        )
+
+        XCTAssertTrue(LocalPlaylistSyncPolicy.matchesProviderPlaylist(
+            linkImportedCopy,
+            source: "qq",
+            id: "playlist-42"
+        ))
+        XCTAssertEqual(
+            LocalPlaylistSyncPolicy.providerIdentityKey(source: "qq", id: "playlist-42"),
+            LocalPlaylistSyncPolicy.providerIdentityKey(source: "tx", id: "playlist-42")
+        )
+    }
+
+    func testLXSyncDeduplicatesQQProviderAliases() {
+        let fromLXCatalog = LXSyncUserPlaylist(
+            id: "sync-tx",
+            name: "QQ 歌单链接导入",
+            source: "tx",
+            sourceListId: "playlist-42",
+            locationUpdateTime: 1_000
+        )
+        let fromQQAccount = LXSyncUserPlaylist(
+            id: "sync-qq",
+            name: "QQ 账号导入",
+            source: "qq",
+            sourceListId: "playlist-42",
+            locationUpdateTime: 2_000
+        )
+
+        let merged = LocalPlaylistSyncPolicy.deduplicateProviderPlaylists([
+            fromLXCatalog, fromQQAccount
+        ])
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].name, "QQ 账号导入")
+        XCTAssertEqual(merged[0].id, "sync-qq")
+        XCTAssertEqual(merged[0].source, "qq")
+    }
+
+    func testProviderDuplicateAcrossDevicesKeepsOneNewestCopy() {
+        let older = LXSyncUserPlaylist(
+            id: "sync-b",
+            name: "Older copy",
+            source: "netease",
+            sourceListId: "42",
+            locationUpdateTime: 1_000
+        )
+        let newer = LXSyncUserPlaylist(
+            id: "sync-z",
+            name: "Newest copy",
+            source: "netease",
+            sourceListId: "42",
+            locationUpdateTime: 2_000,
+            iMusicLocalCopy: true
+        )
+
+        let merged = LocalPlaylistSyncPolicy.deduplicateProviderPlaylists([older, newer])
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].id, "sync-b")
+        XCTAssertEqual(merged[0].name, "Newest copy")
+        XCTAssertEqual(merged[0].iMusicLocalCopy, true)
+    }
+
+    func testProviderDeduplicationPreservesEditedCopyAgainstNewerUnmarkedSnapshot() {
+        let edited = LXSyncUserPlaylist(
+            id: "sync-a",
+            name: "My edited copy",
+            source: "netease",
+            sourceListId: "42",
+            locationUpdateTime: 1_000,
+            iMusicLocalCopy: true
+        )
+        let unmarkedAccountSnapshot = LXSyncUserPlaylist(
+            id: "sync-z",
+            name: "Provider playlist",
+            source: "netease",
+            sourceListId: "42",
+            locationUpdateTime: 2_000,
+            iMusicLocalCopy: false
+        )
+
+        let merged = LocalPlaylistSyncPolicy.deduplicateProviderPlaylists([
+            unmarkedAccountSnapshot, edited
+        ])
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].id, "sync-a")
+        XCTAssertEqual(merged[0].name, "My edited copy")
+        XCTAssertEqual(merged[0].iMusicLocalCopy, true)
+    }
+
+    func testProviderDeduplicationTieBreakIsIndependentOfInputOrder() {
+        let stale = LXSyncUserPlaylist(
+            id: "a",
+            name: "Older",
+            source: "netease",
+            sourceListId: "42",
+            locationUpdateTime: 1_000
+        )
+        let firstTie = LXSyncUserPlaylist(
+            id: "z",
+            name: "First tie",
+            source: "netease",
+            sourceListId: "42",
+            locationUpdateTime: 2_000
+        )
+        let secondTie = LXSyncUserPlaylist(
+            id: "b",
+            name: "Second tie",
+            source: "netease",
+            sourceListId: "42",
+            locationUpdateTime: 2_000
+        )
+
+        let forward = LocalPlaylistSyncPolicy.deduplicateProviderPlaylists([stale, firstTie, secondTie])
+        let reordered = LocalPlaylistSyncPolicy.deduplicateProviderPlaylists([firstTie, secondTie, stale])
+
+        XCTAssertEqual(forward, reordered)
+        XCTAssertEqual(forward.first?.id, "a")
+        XCTAssertEqual(forward.first?.name, "Second tie")
+    }
+
+    func testCrossDeviceDeduplicationRetainsNewestLocalPlaylistID() {
+        let olderLocalID = UUID()
+        let newestLocalID = UUID()
+        let olderLocalCopy = LocalPlaylist(
+            id: olderLocalID,
+            name: "Older local copy",
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 2),
+            remoteSource: "netease",
+            remotePlaylistID: "42",
+            lxSyncID: "sync-b",
+            isLocalCopy: true
+        )
+        let newestLocalCopy = LocalPlaylist(
+            id: newestLocalID,
+            name: "Newest local edit",
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 4),
+            remoteSource: "netease",
+            remotePlaylistID: "42",
+            lxSyncID: "sync-z",
+            isLocalCopy: true
+        )
+        let remoteCopies = [
+            LXSyncUserPlaylist(
+                id: "sync-z",
+                name: "Remote newer copy",
+                source: "netease",
+                sourceListId: "42",
+                locationUpdateTime: 3_000,
+                iMusicLocalCopy: true
+            ),
+            LXSyncUserPlaylist(
+                id: "sync-b",
+                name: "Remote older copy",
+                source: "netease",
+                sourceListId: "42",
+                locationUpdateTime: 2_500,
+                iMusicLocalCopy: true
+            ),
+        ]
+
+        let merged = LocalPlaylistSyncPolicy.mergeAll(
+            remoteCopies,
+            currentPlaylists: [olderLocalCopy, newestLocalCopy]
+        )
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].id, newestLocalID)
+        XCTAssertEqual(merged[0].name, "Newest local edit")
+        XCTAssertEqual(merged[0].lxSyncID, "sync-b")
+    }
+
+    private func track(id: Int, name: String) -> Track {
+        Track(
+            id: id,
+            name: name,
+            artists: [ArtistRef(id: 1, name: "Artist")],
+            album: AlbumRef(id: 1, name: "Album", picUrl: nil),
+            durationMS: 180_000,
+            source: "wy"
+        )
+    }
+}

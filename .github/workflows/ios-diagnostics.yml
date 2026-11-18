@@ -1,0 +1,157 @@
+name: iOS diagnostics IPA (unsigned, self-sign ready)
+
+# Diagnostic build for reproducing sideload crashes. GitHub-hosted macOS
+# runners ship Xcode 26.x / iOS 26.x SDK, so this build targets iOS 26.0;
+# iOS 27.0.1 devices can install it normally. The app itself only uses
+# iOS 26 APIs (Liquid Glass), no iOS 27-only symbols.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'platforms/ios/**'
+      - '.github/workflows/ios-diagnostics.yml'
+
+concurrency:
+  group: ios-diagnostics-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Report toolchain
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_26.6.app
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: |
+          brew untap aws/tap || true
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: platforms/ios/ios
+        run: xcodegen generate
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^MARKETING_VERSION[[:space:]]*=[[:space:]]*//p' platforms/ios/ios/Config/Shared.xcconfig | head -n 1 | tr -d '[:space:]')"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Invalid marketing version: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building iMusic diagnostics $version ($GITHUB_RUN_NUMBER)"
+
+      - name: Build unsigned iOS app
+        working-directory: platforms/ios/ios
+        env:
+          MARKETING_VERSION: ${{ steps.version.outputs.version }}
+          CURRENT_PROJECT_VERSION: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project KumoneIOS.xcodeproj \
+            -scheme KumoneIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$CURRENT_PROJECT_VERSION" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_IDENTITY="" \
+            DEVELOPMENT_TEAM= \
+            build
+
+      - name: Verify bundle metadata for sideloading
+        working-directory: platforms/ios/ios
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          app="build/Build/Products/Release-iphoneos/iMusic.app"
+          bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
+          actual="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")"
+          minimum="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist")"
+          echo "bundle_id=$bundle_id version=$actual minimum_os=$minimum"
+          [[ "$bundle_id" == "com.jiajia2222.imusic.ios" ]] || { echo "Unexpected bundle id" >&2; exit 1; }
+          [[ "$actual" == "$EXPECTED_VERSION" ]] || { echo "Version mismatch" >&2; exit 1; }
+          # A re-signer that drops these keys makes BGTaskScheduler.register
+          # throw an uncatchable NSException at launch; verify they survived.
+          /usr/libexec/PlistBuddy -c 'Print :BGTaskSchedulerPermittedIdentifiers' "$app/Info.plist" >/dev/null
+          /usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' "$app/Info.plist" >/dev/null
+          /usr/libexec/PlistBuddy -c 'Print :UIFileSharingEnabled' "$app/Info.plist" >/dev/null
+          if [[ -e "$app/embedded.mobileprovision" ]]; then
+            echo "Unsigned build must not embed a provisioning profile" >&2
+            exit 1
+          fi
+          if find "$app" -name '*.appex' -print -quit | grep -q .; then
+            echo "Unexpected app extension in the app bundle" >&2
+            exit 1
+          fi
+
+      - name: Package unsigned IPA
+        working-directory: platforms/ios/ios
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist/Payload
+          cp -R build/Build/Products/Release-iphoneos/iMusic.app dist/Payload/iMusic.app
+          name="iMusic-iOS-diagnostics-${RELEASE_VERSION}.${RUN_NUMBER}.ipa"
+          ditto -c -k --sequesterRsrc --keepParent dist/Payload "dist/$name"
+          echo "IPA_NAME=$name" >> "$GITHUB_ENV"
+          ls -lh "dist/$name"
+
+      - name: Inspect IPA contents
+        working-directory: platforms/ios/ios
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 ../../../scripts/verify_ios_ipa.py \
+            "dist/$IPA_NAME" \
+            --expected-version "$EXPECTED_VERSION" \
+            --expected-bundle-id com.jiajia2222.imusic.ios
+          if unzip -l "dist/$IPA_NAME" | grep -E '\.appex/' >/dev/null; then
+            echo 'Unexpected app extension in IPA' >&2
+            exit 1
+          fi
+          unzip -l "dist/$IPA_NAME" | grep -F 'Payload/iMusic.app/' >/dev/null
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: iMusic-iOS-diagnostics-ipa
+          path: platforms/ios/ios/dist/*.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build summary
+        run: |
+          {
+            echo "### iMusic 诊断版 IPA"
+            echo ""
+            echo "- 版本：${{ steps.version.outputs.version }} (build ${{ github.run_number }})"
+            echo "- 最低系统：iOS 26.0，iOS 27.0.1 可安装"
+            echo "- 签名：未签名，需用你的自签工具重签后安装"
+            echo "- 内置：崩溃信号/异常捕获、实时文件日志、应用内导出"
+            echo "- 闪退后取日志：文件 App → 我的 iPhone → iMusic → iMusicDiagnostics → session.log"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,82 @@
+name: iOS launch smoke test
+
+# Requires the upstream self-hosted `xcode-27` runner (iOS 27 simulator).
+# Kept manual-only in this fork; see ios-diagnostics.yml for the hosted build.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-smoke-${{ github.workflow }}-${{ github.ref }}
+  # Preserve active XCTest runs; GitHub may replace an older pending run with
+  # the newest commit, so the current implementation always tests the latest.
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Generate Xcode project
+        working-directory: platforms/ios/ios
+        run: |
+          set -euo pipefail
+          brew untap aws/tap || true
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          xcodegen generate
+
+      - name: Run feature and UI navigation tests, then launch on the latest simulator
+        working-directory: platforms/ios/ios
+        run: |
+          xcodebuild -list -project KumoneIOS.xcodeproj
+          SIMULATOR_ID=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')
+          if [ -z "$SIMULATOR_ID" ]; then
+            echo "No available iPhone simulator was found"
+            xcrun simctl list devices available
+            exit 1
+          fi
+          echo "Using iPhone simulator: $SIMULATOR_ID"
+          # Restart the simulator so stale Accessibility/XCTest services do not
+          # leak into the UI navigation smoke test.
+          xcrun simctl shutdown "$SIMULATOR_ID" || true
+          xcrun simctl boot "$SIMULATOR_ID"
+          xcrun simctl bootstatus "$SIMULATOR_ID" -b
+          xcodebuild test \
+            -project KumoneIOS.xcodeproj \
+            -scheme KumoneIOS \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+            -destination-timeout 120 \
+            -derivedDataPath smoke-build \
+            -resultBundlePath smoke-tests.xcresult \
+            -parallel-testing-enabled NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+          xcrun simctl boot "$SIMULATOR_ID" || true
+          xcrun simctl bootstatus "$SIMULATOR_ID" -b
+          xcrun simctl install "$SIMULATOR_ID" smoke-build/Build/Products/Debug-iphonesimulator/iMusic.app
+          xcrun simctl launch "$SIMULATOR_ID" com.jiajia2222.imusic.ios
+
+      - name: Export UI test attachments for visual diagnosis
+        if: always()
+        working-directory: platforms/ios/ios
+        run: |
+          if [ -d smoke-tests.xcresult ]; then
+            xcrun xcresulttool export attachments \
+              --path smoke-tests.xcresult \
+              --output-path smoke-attachments
+          fi
+
+      - name: Upload simulator test results and screenshots
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-simulator-test-results
+          path: |
+            platforms/ios/ios/smoke-tests.xcresult
+            platforms/ios/ios/smoke-attachments
+          if-no-files-found: warn
