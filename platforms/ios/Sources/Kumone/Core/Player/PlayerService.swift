@@ -985,6 +985,15 @@ final class PlayerService: ObservableObject {
         lyrics = parsed
         updateLyricsCursor(at: livePlaybackTime)
         installLyricCursorObserver()
+        // Lock-screen and Control Center lyrics are driven by whatever this
+        // publishes, and the search itself is otherwise silent, so record the
+        // shape of every success.
+        DiagnosticLogger.shared.info(
+            "歌词已发布: \(track.name) 行数=\(parsed.lines.count) "
+                + "翻译行=\(parsed.lines.filter { $0.translation?.isEmpty == false }.count) "
+                + "逐字行=\(parsed.lines.filter { $0.words?.isEmpty == false }.count)",
+            category: "lyric"
+        )
 
         // Many source adapters provide the original lyrics but omit the
         // translation field. Enrich the already-visible lyrics from a public
@@ -1712,6 +1721,10 @@ final class PlayerService: ObservableObject {
     private func loadLyrics(for track: Track, generation: Int) async {
 #if os(iOS)
         let sourceKey = (track.source ?? track.sourceMetadata["source"] ?? "").lowercased()
+        DiagnosticLogger.shared.info(
+            "开始取歌词: \(track.name)（平台=\(sourceKey.isEmpty ? "无" : sourceKey)）",
+            category: "lyric"
+        )
         if ["wy", "netease", "163"].contains(sourceKey),
            let response = try? await NeteaseAPI.lyric(id: track.id) {
             guard generation == resolveGeneration else { return }
@@ -1790,6 +1803,10 @@ final class PlayerService: ObservableObject {
         guard generation == resolveGeneration else { return }
         lyrics = ParsedLyrics()
         updateLyricsCursor(at: progress)
+        DiagnosticLogger.shared.warning(
+            "歌词为空: \(track.name)（所有来源均未返回可用歌词）",
+            category: "lyric"
+        )
         return
 #else
 

@@ -86,6 +86,11 @@ final class LXUserAPIService: ObservableObject {
     /// Only the first few timer callbacks are logged; LX sources schedule a
     /// lot of timeouts and writing every one would bury the useful lines.
     private var timeoutDiagnosticCount = 0
+    /// "sourceID#platform" → how many slow failures happened in a row. A route
+    /// that keeps burning the full probe is demoted for the rest of the
+    /// session: shorter probe, tried after the healthy routes. Cleared as soon
+    /// as that route answers once.
+    private var slowRouteFailures: [String: Int] = [:]
     @Published private(set) var capabilities: [String: [String]] = [:]
     @Published private(set) var qualityCapabilities: [String: [String]] = [:]
     @Published private(set) var statusMessage = "未加载音源"
@@ -347,7 +352,13 @@ final class LXUserAPIService: ObservableObject {
             DiagnosticLogger.shared.info("resolveMusicURL 成功: \(track.name)", category: "play")
             return resolved
         } catch {
-            DiagnosticLogger.shared.error("resolveMusicURL 失败: \(track.name) -> \(error.localizedDescription)", category: "play")
+            // A song switch cancels the previous resolution. That is normal
+            // operation, and logging it as ERROR would hide real failures.
+            if error is CancellationError || Task.isCancelled {
+                DiagnosticLogger.shared.info("resolveMusicURL 已取消: \(track.name)", category: "play")
+            } else {
+                DiagnosticLogger.shared.error("resolveMusicURL 失败: \(track.name) -> \(error.localizedDescription)", category: "play")
+            }
             throw error
         }
 #if false
@@ -438,11 +449,16 @@ final class LXUserAPIService: ObservableObject {
         }
         var failures: [String] = []
         // A single track used to spend 20 s per candidate platform with no
-        // overall cap, so one dead provider froze playback for minutes. Cap the
-        // whole search: whatever has not answered by then is a failure, and the
-        // player advances instead of hanging.
+        // overall cap, so one dead provider froze playback for minutes. Keep the
+        // per-track ceiling, and additionally cap the first probe of every
+        // route: a healthy provider answers in 50–1200 ms, while the 8–10 s
+        // outliers in practice never returned a URL at all.
         let startedAt = Date()
         var budgetExhausted = false
+        // Routes our own probe cut short, retried once at the very end. Without
+        // that a slow-but-playable provider would become a skipped song; with
+        // it the common case stays fast and the rare case still plays.
+        var slowRoutes: [(source: LXSourceStore.Source, platform: String)] = []
 
         // Resolve each route before preparing fallbacks. This honors the
         // selected source and avoids doing catalogue work for backups when the
@@ -474,88 +490,83 @@ final class LXUserAPIService: ObservableObject {
                 continue
             }
 
-            for platform in platforms {
+            // A provider often has one broken platform and four working ones.
+            // Probe the healthy routes first so the broken one cannot decide
+            // how long the song takes to start.
+            for platform in orderPlatforms(platforms, for: source) {
                 if Date().timeIntervalSince(startedAt) > Self.sourceResolveBudget {
                     budgetExhausted = true
                     break
                 }
-                let attemptStartedAt = Date()
-                let requestTrack: Track
-                if platform == primaryPlatform {
-                    requestTrack = track
-                } else {
-                    // IDs are platform-specific. Match the song before using
-                    // a different platform's musicUrl endpoint.
-                    guard let matched = await LXCatalogService.matchingTrack(track, on: platform) else {
-                        failures.append("\(source.name)/\(platform): track not found")
-                        DiagnosticLogger.shared.info(
-                            "音源 \(source.name)/\(platform) 未命中该歌曲（\(Self.milliseconds(since: attemptStartedAt)) ms）",
-                            category: "play"
-                        )
-                        continue
-                    }
-                    requestTrack = matched
-                }
-                if Date().timeIntervalSince(startedAt) > Self.sourceResolveBudget {
-                    budgetExhausted = true
-                    break
-                }
-                try Task.checkCancellation()
-                try validateSourceConfiguration(sourceRevision, source: source)
-
-                let supported = supportedQualityNames(for: requestTrack, platform: platform)
-                let requested = Self.lxQuality(for: quality,
-                                               supported: supported.isEmpty ? ["128k"] : supported)
-                do {
-                    let response = try await request(
-                        source: platform,
-                        action: "musicUrl",
-                        timeout: Self.remainingSourceBudget(since: startedAt),
-                        info: [
-                            "type": protocolQualityToken(requested, platform: platform),
-                            "musicInfo": musicInfo(
-                                for: requestTrack,
-                                platform: platform,
-                                qualities: supported
-                            )
-                        ]
-                    )
-                    try Task.checkCancellation()
-                    try validateSourceConfiguration(sourceRevision, source: source)
-                    guard let data = response["data"] as? [String: Any],
-                          let rawURL = data["url"] as? String,
-                          let url = URL(string: rawURL),
-                          let scheme = url.scheme?.lowercased(),
-                          scheme == "http" || scheme == "https" else {
-                        failures.append("\(source.name)/\(platform): invalid URL")
-                        DiagnosticLogger.shared.warning(
-                            "音源 \(source.name)/\(platform) 未返回有效播放地址（\(Self.milliseconds(since: attemptStartedAt)) ms）",
-                            category: "play"
-                        )
-                        continue
-                    }
-
+                let routeStartedAt = Date()
+                let outcome = try await attemptRoute(
+                    source: source,
+                    platform: platform,
+                    track: track,
+                    primaryPlatform: primaryPlatform,
+                    quality: quality,
+                    budget: attemptBudget(for: source, platform: platform, since: startedAt)
+                )
+                recordRouteHealth(source: source, platform: platform, outcome: outcome,
+                                  elapsed: Date().timeIntervalSince(routeStartedAt))
+                switch outcome {
+                case .resolved(let resolved):
                     DiagnosticLogger.shared.info(
                         "音乐地址来自 音源=\(source.name) 平台=\(platform) "
-                            + "音质=\(requested) 耗时=\(Self.milliseconds(since: attemptStartedAt)) ms "
-                            + "总耗时=\(Self.milliseconds(since: startedAt)) ms",
+                            + "音质=\(resolved.quality) 总耗时=\(Self.milliseconds(since: startedAt)) ms",
                         category: "play"
                     )
-                    // The LX bridge echoes the requested `type`; it cannot
-                    // confirm the provider's actual codec or bitrate.
-                    return ResolvedURL(url: url, quality: requested,
-                                       qualityIsVerified: false)
-                } catch {
-                    if error is CancellationError { throw error }
-                    try validateSourceConfiguration(sourceRevision, source: source)
-                    failures.append("\(source.name)/\(platform): \(error.localizedDescription)")
-                    DiagnosticLogger.shared.warning(
-                        "音源 \(source.name)/\(platform) 取地址失败（\(Self.milliseconds(since: attemptStartedAt)) ms）：\(error.localizedDescription)",
-                        category: "play"
-                    )
+                    return resolved
+                case .notFound(let reason), .failed(let reason):
+                    failures.append(reason)
+                case .slow(let reason):
+                    failures.append(reason)
+                    slowRoutes.append((source: source, platform: platform))
                 }
             }
             if budgetExhausted { break }
+        }
+
+        // Second chance for the routes our own probe cut short. Only reached
+        // when every fast candidate already failed, so the common case never
+        // pays for it.
+        if !slowRoutes.isEmpty, !budgetExhausted,
+           Date().timeIntervalSince(startedAt) < Self.sourceResolveBudget {
+            DiagnosticLogger.shared.info(
+                "寻源兜底：重试 \(slowRoutes.count) 条慢通道（首次探测上限 \(Int(Self.platformAttemptBudget)) 秒）",
+                category: "play"
+            )
+            for route in slowRoutes {
+                let remaining = Self.sourceResolveBudget - Date().timeIntervalSince(startedAt)
+                guard remaining > 1 else { break }
+                try Task.checkCancellation()
+                try validateSourceConfiguration(sourceRevision, source: route.source)
+                guard await activate(route.source) else { continue }
+                try validateSourceConfiguration(sourceRevision, source: route.source)
+                let routeStartedAt = Date()
+                let outcome = try await attemptRoute(
+                    source: route.source,
+                    platform: route.platform,
+                    track: track,
+                    primaryPlatform: primaryPlatform,
+                    quality: quality,
+                    budget: max(3, remaining)
+                )
+                recordRouteHealth(source: route.source, platform: route.platform,
+                                  outcome: outcome,
+                                  elapsed: Date().timeIntervalSince(routeStartedAt))
+                switch outcome {
+                case .resolved(let resolved):
+                    DiagnosticLogger.shared.info(
+                        "兜底命中 音源=\(route.source.name) 平台=\(route.platform) "
+                            + "音质=\(resolved.quality) 总耗时=\(Self.milliseconds(since: startedAt)) ms",
+                        category: "play"
+                    )
+                    return resolved
+                case .notFound(let reason), .failed(let reason), .slow(let reason):
+                    failures.append(reason)
+                }
+            }
         }
 
         if budgetExhausted {
@@ -571,8 +582,202 @@ final class LXUserAPIService: ObservableObject {
         throw LXError.resolveFailed(failures)
     }
 
+    /// How a single (source, platform) candidate ended. `slow` is the only
+    /// outcome that earns a second attempt: it means our own probe gave up,
+    /// not that the provider answered "no".
+    private enum RouteOutcome {
+        case resolved(ResolvedURL)
+        case notFound(String)
+        case failed(String)
+        case slow(String)
+    }
+
+    /// Runs one candidate route. Throws only on cancellation, so the caller can
+    /// tell a cancelled song switch apart from a provider failure.
+    private func attemptRoute(source: LXSourceStore.Source,
+                              platform: String,
+                              track: Track,
+                              primaryPlatform: String,
+                              quality: String,
+                              budget: TimeInterval) async throws -> RouteOutcome {
+        let sourceRevision = LXSourceStore.shared.configurationRevision
+        let attemptStartedAt = Date()
+        // A timed-out provider request tears the JavaScript context down
+        // (`cancelPendingRequest` drops it so late callbacks cannot attach to
+        // the next route), which leaves every later platform without a source.
+        // Reload before probing so one timeout cannot poison the rest.
+        if loadedID != source.id || context == nil {
+            guard await activate(source) else {
+                return .failed("\(source.name): 重新加载失败")
+            }
+        }
+        let requestTrack: Track
+        if platform == primaryPlatform {
+            requestTrack = track
+        } else {
+            // IDs are platform-specific. Match the song before using a
+            // different platform's musicUrl endpoint.
+            guard let matched = await LXCatalogService.matchingTrack(track, on: platform) else {
+                DiagnosticLogger.shared.info(
+                    "音源 \(source.name)/\(platform) 未命中该歌曲（\(Self.milliseconds(since: attemptStartedAt)) ms）",
+                    category: "play"
+                )
+                return .notFound("\(source.name)/\(platform): track not found")
+            }
+            requestTrack = matched
+        }
+        try Task.checkCancellation()
+        try validateSourceConfiguration(sourceRevision, source: source)
+
+        let supported = supportedQualityNames(for: requestTrack, platform: platform)
+        let requested = Self.lxQuality(for: quality,
+                                       supported: supported.isEmpty ? ["128k"] : supported)
+        do {
+            let response = try await request(
+                source: platform,
+                action: "musicUrl",
+                timeout: budget,
+                info: [
+                    "type": protocolQualityToken(requested, platform: platform),
+                    "musicInfo": musicInfo(
+                        for: requestTrack,
+                        platform: platform,
+                        qualities: supported
+                    )
+                ]
+            )
+            try Task.checkCancellation()
+            try validateSourceConfiguration(sourceRevision, source: source)
+            guard let data = response["data"] as? [String: Any],
+                  let rawURL = data["url"] as? String,
+                  let url = URL(string: rawURL),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else {
+                DiagnosticLogger.shared.warning(
+                    "音源 \(source.name)/\(platform) 未返回有效播放地址（\(Self.milliseconds(since: attemptStartedAt)) ms）",
+                    category: "play"
+                )
+                return .failed("\(source.name)/\(platform): invalid URL")
+            }
+            DiagnosticLogger.shared.info(
+                "音源 \(source.name)/\(platform) 取地址用时 \(Self.milliseconds(since: attemptStartedAt)) ms",
+                category: "play"
+            )
+            // The LX bridge echoes the requested `type`; it cannot confirm the
+            // provider's actual codec or bitrate.
+            return .resolved(ResolvedURL(url: url, quality: requested,
+                                        qualityIsVerified: false))
+        } catch {
+            if error is CancellationError { throw error }
+            try validateSourceConfiguration(sourceRevision, source: source)
+            let elapsed = Self.milliseconds(since: attemptStartedAt)
+            if let lx = error as? LXError, case .requestTimedOut = lx {
+                DiagnosticLogger.shared.warning(
+                    "音源 \(source.name)/\(platform) 探测超时（\(elapsed) ms，上限 \(Int(budget)) 秒），排到兜底阶段",
+                    category: "play"
+                )
+                return .slow("\(source.name)/\(platform): 探测超时 \(elapsed) ms")
+            }
+            DiagnosticLogger.shared.warning(
+                "音源 \(source.name)/\(platform) 取地址失败（\(elapsed) ms）：\(error.localizedDescription)",
+                category: "play"
+            )
+            return .failed("\(source.name)/\(platform): \(error.localizedDescription)")
+        }
+    }
+
+    private func routeKey(_ source: LXSourceStore.Source, _ platform: String) -> String {
+        "\(source.id)#\(platform)"
+    }
+
+    /// Healthy platforms keep their natural order; demoted ones move to the
+    /// back so a fast alternative can answer first.
+    private func orderPlatforms(_ platforms: [String],
+                                for source: LXSourceStore.Source) -> [String] {
+        guard platforms.count > 1 else { return platforms }
+        var healthy: [String] = []
+        var demoted: [String] = []
+        for platform in platforms {
+            let failures = slowRouteFailures[routeKey(source, platform)] ?? 0
+            if failures >= Self.slowRouteFailureThreshold {
+                demoted.append(platform)
+            } else {
+                healthy.append(platform)
+            }
+        }
+        return healthy + demoted
+    }
+
+    private func attemptBudget(for source: LXSourceStore.Source,
+                               platform: String,
+                               since start: Date) -> TimeInterval {
+        let demoted = (slowRouteFailures[routeKey(source, platform)] ?? 0)
+            >= Self.slowRouteFailureThreshold
+        let cap = demoted ? Self.demotedPlatformAttemptBudget : Self.platformAttemptBudget
+        return max(2.5, min(cap, Self.remainingSourceBudget(since: start)))
+    }
+
+    private func recordRouteHealth(source: LXSourceStore.Source,
+                                   platform: String,
+                                   outcome: RouteOutcome,
+                                   elapsed: TimeInterval) {
+        let key = routeKey(source, platform)
+        switch outcome {
+        case .resolved, .notFound:
+            // Either a working route or a provider that answered quickly; both
+            // mean the route is responsive.
+            slowRouteFailures.removeValue(forKey: key)
+        case .failed:
+            // A fast failure is a real answer ("no such song"), not slowness.
+            if elapsed >= Self.slowRouteFailureWindow {
+                noteSlowRouteFailure(key: key, source: source, platform: platform)
+            } else {
+                slowRouteFailures.removeValue(forKey: key)
+            }
+        case .slow:
+            noteSlowRouteFailure(key: key, source: source, platform: platform)
+        }
+    }
+
+    private func noteSlowRouteFailure(key: String,
+                                      source: LXSourceStore.Source,
+                                      platform: String) {
+        if slowRouteFailures.count > 64 { slowRouteFailures.removeAll() }
+        let count = (slowRouteFailures[key] ?? 0) + 1
+        slowRouteFailures[key] = count
+        guard count == Self.slowRouteFailureThreshold else { return }
+        DiagnosticLogger.shared.warning(
+            "音源 \(source.name)/\(platform) 连续 \(count) 次慢失败，"
+                + "后续只探测 \(Int(Self.demotedPlatformAttemptBudget)) 秒并排到健康通道之后",
+            category: "play"
+        )
+    }
+
     /// Total wall-clock allowance for resolving one track across every source.
     private static let sourceResolveBudget: TimeInterval = 20
+
+    /// First probe of one candidate route. Measured against a real log: the
+    /// fastest useful providers answered in 50–400 ms, the slowest successful
+    /// one took 3.96 s, while every 8–10 s attempt failed anyway.
+    private static let platformAttemptBudget: TimeInterval = 5
+
+    /// A route that burned the full probe this many times in a row is treated
+    /// as broken for the rest of the session.
+    private static let slowRouteFailureThreshold = 3
+    private static let demotedPlatformAttemptBudget: TimeInterval = 3
+    /// Failures returning faster than this are real answers, not slowness.
+    private static let slowRouteFailureWindow: TimeInterval = 3
+
+    /// Lyrics run in their own resolver, so they never delay playback, but a
+    /// dead provider used to keep them running for minutes. Bound both the
+    /// single request and the whole search.
+    private static let lyricResolveBudget: TimeInterval = 15
+    private static let lyricAttemptBudget: TimeInterval = 6
+
+    /// A manual health check must finish while the user is still looking at the
+    /// button: one short probe per platform, plus a ceiling for the whole run.
+    private static let sourceCheckAttemptBudget: TimeInterval = 6
+    private static let sourceCheckBudget: TimeInterval = 20
 
     /// Timeout handed to a single provider call, clamped to what is left of the
     /// per-track budget so a slow provider cannot outlive it.
@@ -676,6 +881,8 @@ final class LXUserAPIService: ObservableObject {
     /// and swapping the shared context could interrupt an in-flight lookup.
     func checkSource(_ source: LXSourceStore.Source) async -> SourceCheckResult {
         let checker = LXUserAPIService()
+        let startedAt = Date()
+        DiagnosticLogger.shared.info("音源体检开始: \(source.name)", category: "plugin")
         let result = await withTaskCancellationHandler {
             defer { checker.cancelPendingRequests() }
             checker.load(source)
@@ -690,6 +897,10 @@ final class LXUserAPIService: ObservableObject {
         if !Task.isCancelled, LXSourceStore.shared.selectedID == source.id {
             statusMessage = result.detail.map { "\(result.message)：\($0)" } ?? result.message
         }
+        DiagnosticLogger.shared.info(
+            "音源体检结束: \(source.name) → \(result.message)（\(Self.milliseconds(since: startedAt)) ms）",
+            category: "plugin"
+        )
         return result
     }
 
@@ -715,17 +926,33 @@ final class LXUserAPIService: ObservableObject {
 
         var failures: [String] = []
         var requiresTrackPlatforms: [String] = []
-        for platform in supportedPlatforms {
+        let startedAt = Date()
+        for (index, platform) in supportedPlatforms.enumerated() {
             guard !Task.isCancelled else {
                 return SourceCheckResult(status: .unavailable, message: "检测已取消", detail: nil)
             }
+            // A health check used to allow 20 s per platform with no overall
+            // limit, which made the button look dead for over half a minute on
+            // a slow source.
+            if Date().timeIntervalSince(startedAt) > Self.sourceCheckBudget {
+                for rest in supportedPlatforms.dropFirst(index) {
+                    DiagnosticLogger.shared.info(
+                        "音源体检跳过 \(LXCatalogPlatform.displayName(for: rest))：已用满 \(Int(Self.sourceCheckBudget)) 秒预算",
+                        category: "plugin"
+                    )
+                }
+                break
+            }
             let platformName = LXCatalogPlatform.displayName(for: platform)
+            let attemptStartedAt = Date()
             let currentTrack = PlayerService.shared.currentTrack
             let track = currentTrack.flatMap {
                 canonicalPlatform($0.source ?? $0.sourceMetadata["source"]) == platform ? $0 : nil
             } ?? Self.sourceCheckTrack(for: platform)
             guard let track else {
                 requiresTrackPlatforms.append(platformName)
+                DiagnosticLogger.shared.info(
+                    "音源体检 \(platformName)：需要该平台歌曲，跳过", category: "plugin")
                 continue
             }
 
@@ -737,6 +964,7 @@ final class LXUserAPIService: ObservableObject {
             let info = musicInfo(for: track, platform: platform, qualities: supportedQualitys)
             do {
                 let response = try await request(source: platform, action: "musicUrl",
+                                                 timeout: Self.sourceCheckAttemptBudget,
                                                  info: ["type": protocolQualityToken(requestedQuality, platform: platform), "musicInfo": info])
                 guard !Task.isCancelled else {
                     return SourceCheckResult(status: .unavailable, message: "检测已取消", detail: nil)
@@ -747,8 +975,14 @@ final class LXUserAPIService: ObservableObject {
                       let scheme = url.scheme?.lowercased(),
                       scheme == "http" || scheme == "https" else {
                     failures.append("\(platformName)：没有返回有效播放地址")
+                    DiagnosticLogger.shared.info(
+                        "音源体检 \(platformName)：没有返回有效播放地址（\(Self.milliseconds(since: attemptStartedAt)) ms）",
+                        category: "plugin")
                     continue
                 }
+                DiagnosticLogger.shared.info(
+                    "音源体检 \(platformName)：通过（\(Self.milliseconds(since: attemptStartedAt)) ms，档位 \(requestedQuality)）",
+                    category: "plugin")
 
                 let detail = "已通过 \(platformName) 的 musicUrl 接口，请求档位：\(requestedQuality)（音源未提供实际音质信息）"
                 let result = SourceCheckResult(status: .available,
@@ -761,12 +995,18 @@ final class LXUserAPIService: ObservableObject {
                     return SourceCheckResult(status: .unavailable, message: "检测已取消", detail: nil)
                 }
                 failures.append("\(platformName)：\(error.localizedDescription)")
+                DiagnosticLogger.shared.warning(
+                    "音源体检 \(platformName)：失败（\(Self.milliseconds(since: attemptStartedAt)) ms）：\(error.localizedDescription)",
+                    category: "plugin")
             }
         }
 
         if !requiresTrackPlatforms.isEmpty {
             let attemptedDetail = failures.isEmpty ? nil : "已尝试的平台：\(failures.joined(separator: "；"))。"
             let trackDetail = "请先播放一首来自 \(requiresTrackPlatforms.joined(separator: "、")) 的歌曲，再重新检测。"
+            DiagnosticLogger.shared.info(
+                "音源体检完成：需要该平台歌曲才能确认（耗时 \(Self.milliseconds(since: startedAt)) ms）",
+                category: "plugin")
             return SourceCheckResult(status: .requiresTrack,
                                      message: "需要该平台歌曲才能确认",
                                      detail: [attemptedDetail, trackDetail].compactMap { $0 }.joined())
@@ -776,6 +1016,9 @@ final class LXUserAPIService: ObservableObject {
         let result = SourceCheckResult(status: .unavailable,
                                        message: "音源不可用",
                                        detail: detail)
+        DiagnosticLogger.shared.warning(
+            "音源体检完成：不可用（耗时 \(Self.milliseconds(since: startedAt)) ms）：\(detail)",
+            category: "plugin")
         statusMessage = "\(result.message)：\(detail)"
         return result
     }
@@ -819,28 +1062,49 @@ final class LXUserAPIService: ObservableObject {
         guard !playbackSources.isEmpty else { throw LXError.noSource }
 
         let primaryPlatform = canonicalPlatform(track.source ?? track.sourceMetadata["source"]) ?? "wy"
+        let startedAt = Date()
+        var missed: [String] = []
+        DiagnosticLogger.shared.info(
+            "歌词解析开始: \(track.name)（主平台=\(primaryPlatform)，候选音源=\(playbackSources.count)）",
+            category: "lyric"
+        )
         for source in playbackSources {
             try Task.checkCancellation()
+            if Date().timeIntervalSince(startedAt) > Self.lyricResolveBudget {
+                DiagnosticLogger.shared.warning(
+                    "歌词解析超出 \(Int(Self.lyricResolveBudget)) 秒预算，放弃剩余音源: \(track.name)",
+                    category: "lyric"
+                )
+                break
+            }
             try validateSourceConfiguration(sourceRevision, source: source)
             let isAvailable = await activate(source)
             try validateSourceConfiguration(sourceRevision, source: source)
-            guard isAvailable else { continue }
+            guard isAvailable else {
+                missed.append("\(source.name): 加载失败")
+                continue
+            }
             for platform in sourceCandidates(for: track, action: "lyric") {
                 let requestTrack: Track
                 if platform == primaryPlatform {
                     requestTrack = track
                 } else {
-                    guard let matched = await LXCatalogService.matchingTrack(track, on: platform) else { continue }
+                    guard let matched = await LXCatalogService.matchingTrack(track, on: platform) else {
+                        missed.append("\(source.name)/\(platform): 未匹配到歌曲")
+                        continue
+                    }
                     requestTrack = matched
                 }
                 try Task.checkCancellation()
                 try validateSourceConfiguration(sourceRevision, source: source)
+                let attemptStartedAt = Date()
 
                 for attempt in 0..<2 {
                     do {
                         let response = try await request(
                             source: platform,
                             action: "lyric",
+                            timeout: Self.lyricAttemptBudget,
                             info: [
                                 "type": "lyric",
                                 "musicInfo": musicInfo(for: requestTrack, platform: platform)
@@ -848,15 +1112,32 @@ final class LXUserAPIService: ObservableObject {
                         )
                         try Task.checkCancellation()
                         try validateSourceConfiguration(sourceRevision, source: source)
-                        if let lyrics = await lyricPayload(from: response) { return lyrics }
+                        if let lyrics = await lyricPayload(from: response) {
+                            DiagnosticLogger.shared.info(
+                                "歌词命中 音源=\(source.name) 平台=\(platform) "
+                                    + "正文=\(lyrics.lyric.count)字 "
+                                    + "翻译=\(lyrics.tlyric?.isEmpty == false ? "有" : "无") "
+                                    + "逐字=\(lyrics.lxlyric?.isEmpty == false || lyrics.yrc?.isEmpty == false ? "有" : "无") "
+                                    + "耗时=\(Self.milliseconds(since: attemptStartedAt)) ms "
+                                    + "总耗时=\(Self.milliseconds(since: startedAt)) ms",
+                                category: "lyric"
+                            )
+                            return lyrics
+                        }
                     } catch {
                         if error is CancellationError { throw error }
                         try validateSourceConfiguration(sourceRevision, source: source)
                     }
                     if attempt == 0 { try? await Task.sleep(for: .milliseconds(350)) }
                 }
+                missed.append("\(source.name)/\(platform): 无歌词（\(Self.milliseconds(since: attemptStartedAt)) ms）")
             }
         }
+        DiagnosticLogger.shared.warning(
+            "歌词解析失败: \(track.name)（耗时 \(Self.milliseconds(since: startedAt)) ms，"
+                + "明细：\(missed.isEmpty ? "无可尝试的组合" : missed.joined(separator: " | "))）",
+            category: "lyric"
+        )
         throw LXError.resolveFailed([])
     }
 
@@ -1585,6 +1866,9 @@ final class LXUserAPIService: ObservableObject {
         loadedScript = nil
         capabilities = [:]
         qualityCapabilities = [:]
+        // Route health describes the previous source configuration; a new or
+        // edited script deserves a fresh measurement.
+        slowRouteFailures.removeAll()
         statusMessage = "音源配置已更新"
         if sourceOperationActive {
             selectedSourceReloadPending = true

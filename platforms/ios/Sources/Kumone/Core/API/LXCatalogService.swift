@@ -186,16 +186,68 @@ enum LXCatalogService {
         guard let platform = LXCatalogPlatform(rawValue: platform), platform != .aggregate else {
             return nil
         }
+        // Playback fallback, the deferred retry and the lyric lookup all match
+        // the same song, and each match is a full catalogue search. Reuse the
+        // answer for the session instead of paying that round trip again.
+        let cacheKey = "\(platform.rawValue)|\(sourceTrack.id)|\(sourceTrack.name)|\(sourceTrack.artistNames)"
+        if case .cached(let cached) = matchCache.lookup(cacheKey) { return cached }
+
         let keyword = [sourceTrack.name, sourceTrack.artistNames]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        guard !keyword.isEmpty,
-              let candidates = try? await search(keyword, platform: platform, page: 1, limit: 12),
-              !candidates.isEmpty else { return nil }
-
-        return NeteaseTrackMatcher.bestCandidate(for: sourceTrack, in: candidates)
+        var matched: Track?
+        if !keyword.isEmpty,
+           let candidates = try? await search(keyword, platform: platform, page: 1, limit: 12) {
+            // Only a completed search may be cached. A thrown request is a
+            // transient failure, and caching it would keep the song unplayable
+            // on that platform for the rest of the session.
+            if !candidates.isEmpty {
+                matched = NeteaseTrackMatcher.bestCandidate(for: sourceTrack, in: candidates)
+            }
+            matchCache.store(matched, for: cacheKey)
+        }
+        return matched
     }
+
+    /// Small locked cache for cross-platform matches. `LXCatalogService` is not
+    /// actor isolated, so mutable static storage needs its own lock.
+    private final class MatchCache: @unchecked Sendable {
+        enum Lookup {
+            case cached(Track?)
+            case unknown
+        }
+
+        private let lock = NSLock()
+        private var hits: [String: Track] = [:]
+        private var misses: Set<String> = []
+        private let limit = 300
+
+        func lookup(_ key: String) -> Lookup {
+            lock.lock()
+            defer { lock.unlock() }
+            if let hit = hits[key] { return .cached(hit) }
+            if misses.contains(key) { return .cached(nil) }
+            return .unknown
+        }
+
+        func store(_ track: Track?, for key: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            if hits.count + misses.count >= limit {
+                hits.removeAll()
+                misses.removeAll()
+            }
+            if let track {
+                hits[key] = track
+                misses.remove(key)
+            } else {
+                misses.insert(key)
+            }
+        }
+    }
+
+    private static let matchCache = MatchCache()
 
     /// Loads an album as a source-owned detail page. LX sources do not share
     /// NetEase's numeric album IDs, so the page first uses the source ID from
