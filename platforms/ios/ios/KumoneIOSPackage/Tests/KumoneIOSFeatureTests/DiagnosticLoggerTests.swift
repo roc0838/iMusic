@@ -16,7 +16,7 @@ final class DiagnosticLoggerTests: XCTestCase {
     func testExportRedactsCredentials() throws {
         let logger = DiagnosticLogger.shared
         logger.startSession()
-        let secret = "ghp_UNITTESTSECRET0123456789"
+        let secret = "UNITTESTSECRET0123456789"
         logger.info("cookie=MUSIC_U_UNITTESTSECRET012345 token=\(secret)", category: "test")
 
         let url = try XCTUnwrap(logger.exportURL())
