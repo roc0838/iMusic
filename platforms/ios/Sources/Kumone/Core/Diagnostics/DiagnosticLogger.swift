@@ -18,7 +18,7 @@ private func imusicWriteStatic(_ fd: Int32, _ text: StaticString) {
     guard fd >= 0 else { return }
     text.withUTF8Buffer { buffer in
         guard let base = buffer.baseAddress, buffer.count > 0 else { return }
-        _ = Darwin.write(fd, base, buffer.count)
+        _ = Darwin.write(fd, UnsafeRawPointer(base), buffer.count)
     }
 }
 
@@ -262,7 +262,7 @@ public final class DiagnosticLogger {
             try? fm.removeItem(at: file)
         }
         if !fm.fileExists(atPath: logURL.path) {
-            fm.createFile(atPath: logURL.path, contents: nil)
+            _ = fm.createFile(atPath: logURL.path, contents: nil)
         }
         fd = logURL.path.withCString { Darwin.open($0, O_WRONLY | O_CREAT | O_APPEND, 0o644) }
         imusicCrashFD = fd
@@ -309,7 +309,7 @@ public final class DiagnosticLogger {
             guard let base = buffer.baseAddress else { return }
             var offset = 0
             while offset < buffer.count {
-                let written = Darwin.write(fd, base.advanced(by: offset), buffer.count - offset)
+                let written = Darwin.write(fd, UnsafeRawPointer(base.advanced(by: offset)), buffer.count - offset)
                 if written <= 0 { break }
                 offset += written
             }

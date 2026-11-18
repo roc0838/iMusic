@@ -210,16 +210,16 @@ final class LXUserAPIService: ObservableObject {
     }
 
     func resolveMusicURL(for track: Track, quality: String) async throws -> ResolvedURL {
-        DiagnosticLogger.shared.info("resolveMusicURL 开始: \(track.title) / \(quality)", category: "play")
+        DiagnosticLogger.shared.info("resolveMusicURL 开始: \(track.name) / \(quality)", category: "play")
         do {
             try await acquireSourceOperation()
             defer { releaseSourceOperation() }
             try Task.checkCancellation()
             let resolved = try await resolveMusicURLAcrossSources(for: track, quality: quality)
-            DiagnosticLogger.shared.info("resolveMusicURL 成功: \(track.title)", category: "play")
+            DiagnosticLogger.shared.info("resolveMusicURL 成功: \(track.name)", category: "play")
             return resolved
         } catch {
-            DiagnosticLogger.shared.error("resolveMusicURL 失败: \(track.title) -> \(error.localizedDescription)", category: "play")
+            DiagnosticLogger.shared.error("resolveMusicURL 失败: \(track.name) -> \(error.localizedDescription)", category: "play")
             throw error
         }
 #if false
