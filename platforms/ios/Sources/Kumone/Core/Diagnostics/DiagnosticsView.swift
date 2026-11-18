@@ -12,6 +12,8 @@ public struct DiagnosticsView: View {
     @State private var shareURL: URL?
     @State private var statusMessage = ""
     @State private var showClearConfirmation = false
+    @State private var pluginReport: [String] = []
+    @State private var isCheckingPlugins = false
 
     public init() {}
 
@@ -73,6 +75,30 @@ public struct DiagnosticsView: View {
                     .frame(minHeight: 220, maxHeight: 420)
                 } header: {
                     Text("最近日志（末尾 \(DiagnosticLoggerPreviewLimit.kilobytes) KB）")
+                }
+
+                Section {
+                    Button {
+                        Task {
+                            isCheckingPlugins = true
+                            pluginReport = await LXUserAPIService.shared.musicFreePluginReport()
+                            isCheckingPlugins = false
+                        }
+                    } label: {
+                        Label(isCheckingPlugins ? "正在检测插件…" : "检测 MusicFree 插件",
+                              systemImage: "puzzlepiece.extension")
+                    }
+                    .disabled(isCheckingPlugins)
+                    ForEach(pluginReport, id: \.self) { line in
+                        Text(line)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                } header: {
+                    Text("插件体检")
+                } footer: {
+                    Text("只加载插件并读取它声明的方法，不会切换当前音源或改变播放状态。详细过程会写入诊断日志。")
                 }
 
                 Section {

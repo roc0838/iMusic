@@ -356,6 +356,13 @@ struct LXSourceManagerView: View {
                         Text(source.name)
                             .font(.body.weight(.semibold))
                             .lineLimit(1)
+                        if source.kind == .musicFree {
+                            Text("插件")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 5)
+                                .background(.quaternary, in: Capsule())
+                        }
                         if lxStore.selectedID == source.id {
                             Text("当前")
                                 .font(.caption2.weight(.semibold))

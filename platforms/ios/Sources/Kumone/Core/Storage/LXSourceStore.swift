@@ -8,6 +8,21 @@ import UIKit
 /// client, just like the upstream LX application.
 @MainActor
 final class LXSourceStore: ObservableObject {
+    /// Protocol of an imported script. This is derived from the script text on
+    /// every access instead of being persisted: old exports have no such field,
+    /// and re-deriving avoids a migration that could break existing LX sources.
+    enum SourceKind: String {
+        case lx
+        case musicFree
+
+        var displayName: String {
+            switch self {
+            case .lx: return "LX 音源"
+            case .musicFree: return "MusicFree 插件"
+            }
+        }
+    }
+
     struct Source: Codable, Hashable, Identifiable {
         let id: String
         let name: String
@@ -19,6 +34,22 @@ final class LXSourceStore: ObservableObject {
         /// The download URL is metadata only. Playback always uses the local
         /// script, so an online source changing cannot silently change it.
         let sourceURL: String?
+
+        /// MusicFree plugins are CommonJS modules; LX sources use `globalThis.lx`
+        /// plus the event bridge. A script containing both is treated as LX so
+        /// existing sources keep their current behaviour.
+        var kind: SourceKind {
+            let lower = script.lowercased()
+            let lxSignals = [
+                "globalthis.lx", "lx.on(", "lx.send(", "event_names", "__lx_native__"
+            ].filter { lower.contains($0) }.count
+            let mfSignals = [
+                "module.exports", "getmediasource", "supportedsearchtype",
+                "importmusicsheet", "getmusicsheetinfo", "require(\"axios\")",
+                "require('axios')", "getlyric"
+            ].filter { lower.contains($0) }.count
+            return mfSignals > 0 && lxSignals == 0 ? .musicFree : .lx
+        }
     }
 
     static let shared = LXSourceStore()
@@ -131,7 +162,7 @@ final class LXSourceStore: ObservableObject {
 
         let source = decodeExport(raw, suggestedName: suggestedName, sourceURL: sourceURL)
             ?? sourceFromHeader(raw, suggestedName: suggestedName, sourceURL: sourceURL)
-        guard isLXScript(source.script) else {
+        guard isLXScript(source.script) || isMusicFreeScript(source.script) else {
             throw ImportError.invalidScript
         }
         return source
@@ -514,7 +545,7 @@ final class LXSourceStore: ObservableObject {
         // both desktop and mobile LX can be imported.
         if let text = value as? String {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if isLXScript(trimmed) {
+            if isLXScript(trimmed) || isMusicFreeScript(trimmed) {
                 return Source(
                     id: UUID().uuidString,
                     name: suggestedName,
@@ -560,7 +591,7 @@ final class LXSourceStore: ObservableObject {
         for key in scriptKeys {
             guard let scriptValue = valueForKey(key, in: dictionary),
                   let script = jsonString(scriptValue),
-                  isLXScript(script) else { continue }
+                  (isLXScript(script) || isMusicFreeScript(script)) else { continue }
 
             return Source(
                 id: jsonString(valueForKeys(["id", "sourceId", "key"], in: dictionary))
@@ -622,6 +653,21 @@ final class LXSourceStore: ObservableObject {
                 : String(doubleValue)
         }
         return nil
+    }
+
+    /// Enabled MusicFree plugins in playback priority order. Kept separate
+    /// from `playbackSources` only for UI/diagnostics; the shared playback
+    /// list still contains both kinds so the fallback chain is unchanged.
+    var musicFreeSources: [Source] {
+        playbackSources.filter { $0.kind == .musicFree }
+    }
+
+    private func isMusicFreeScript(_ script: String) -> Bool {
+        let lower = script.lowercased()
+        guard lower.contains("module.exports") else { return false }
+        return lower.contains("require(\"axios\")") || lower.contains("require('axios')")
+            || lower.contains("getmediasource") || lower.contains("getlyric")
+            || lower.contains("supportedsearchtype")
     }
 
     private func isLXScript(_ script: String) -> Bool {

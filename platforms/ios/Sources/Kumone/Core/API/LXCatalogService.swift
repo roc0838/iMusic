@@ -105,6 +105,15 @@ enum LXCatalogService {
                         try? await search(keyword, platform: item, page: page, limit: limit)
                     }
                 }
+                // User-imported MusicFree plugins join the same aggregate
+                // page. They run in an isolated resolver, so a slow plugin
+                // cannot replace the JavaScript context used for playback.
+                group.addTask {
+                    let tracks = await LXUserAPIService.shared.musicFreeSearch(
+                        keyword: keyword, page: page, limit: limit
+                    )
+                    return tracks.isEmpty ? nil : tracks
+                }
                 var all: [[Track]] = []
                 var failures = 0
                 for await result in group {

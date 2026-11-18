@@ -52,6 +52,7 @@ final class LXUserAPIService: ObservableObject {
     private static let lyricsResolver = LXUserAPIService()
     private static let qualityResolver = LXUserAPIService()
     private static let downloadResolver = LXUserAPIService()
+    private static let pluginSearchResolver = LXUserAPIService()
 
     private let session: URLSession
     private var context: JSContext?
@@ -68,6 +69,12 @@ final class LXUserAPIService: ObservableObject {
     private var sourceOperationWaiters: [SourceOperationWaiter] = []
     private var selectedSourceReloadPending = false
     private var selectedSourceReloadForced = false
+    /// A MusicFree plugin uses a different preload but the same native bridge.
+    private var loadedKind: LXSourceStore.SourceKind = .lx
+    private var mfHTTPTasks: [String: URLSessionDataTask] = [:]
+    private var mfTimers: [String: Task<Void, Never>] = [:]
+    /// Per-host cookie jar shared by plugins in this resolver instance.
+    private var mfCookies: [String: [String]] = [:]
     /// Only the first few timer callbacks are logged; LX sources schedule a
     /// lot of timeouts and writing every one would bury the useful lines.
     private var timeoutDiagnosticCount = 0
@@ -92,8 +99,65 @@ final class LXUserAPIService: ObservableObject {
     }
 
     static func sourceConfigurationDidChange() {
-        [shared, lyricsResolver, qualityResolver, downloadResolver]
+        [shared, lyricsResolver, qualityResolver, downloadResolver, pluginSearchResolver]
             .forEach { $0.invalidateSourceWork() }
+    }
+
+    /// Queries every enabled MusicFree plugin with its `search` method.
+    /// Results are deliberately kept in a separate resolver so a search never
+    /// replaces the JavaScript context used by active playback or lyrics.
+    func musicFreeSearch(keyword: String, page: Int, limit: Int) async -> [Track] {
+        let resolver = Self.pluginSearchResolver
+        let store = LXSourceStore.shared
+        let revision = store.configurationRevision
+        let sources = store.musicFreeSources
+        guard !sources.isEmpty else { return [] }
+
+        do {
+            try await resolver.acquireSourceOperation()
+        } catch {
+            return []
+        }
+        defer { resolver.releaseSourceOperation() }
+
+        var collected: [Track] = []
+        for source in sources {
+            guard !Task.isCancelled,
+                  store.configurationRevision == revision,
+                  store.playbackSources.contains(where: {
+                      $0.id == source.id && $0.script == source.script
+                  }) else { break }
+            guard await resolver.activate(source) else { continue }
+            do {
+                let response = try await resolver.requestPlugin(
+                    method: "search",
+                    args: [keyword, page, "music"]
+                )
+                guard let envelope = response["result"] as? [String: Any],
+                      let items = envelope["data"] as? [[String: Any]] else { continue }
+                let platform = (envelope["platform"] as? String).flatMap({ $0.isEmpty ? nil : $0 })
+                    ?? source.name
+                let tracks = items.compactMap {
+                    MusicFreeTrackConverter.track(
+                        from: $0,
+                        platform: platform,
+                        sourceID: source.id
+                    )
+                }
+                collected.append(contentsOf: tracks.prefix(limit))
+                DiagnosticLogger.shared.info(
+                    "MusicFree 插件搜索 \(source.name): \(tracks.count) 条",
+                    category: "plugin"
+                )
+            } catch {
+                if error is CancellationError { break }
+                DiagnosticLogger.shared.warning(
+                    "MusicFree 插件搜索失败 \(source.name): \(error.localizedDescription)",
+                    category: "plugin"
+                )
+            }
+        }
+        return collected
     }
 
     func resolveDownloadMusicURL(for track: Track, quality: String) async throws -> ResolvedURL {
@@ -116,6 +180,7 @@ final class LXUserAPIService: ObservableObject {
         context = nil
         loadedID = source?.id
         loadedScript = source?.script
+        loadedKind = source?.kind ?? .lx
         capabilities = [:]
         qualityCapabilities = [:]
         statusMessage = source == nil ? "未选择音源" : "正在加载音源"
@@ -129,12 +194,14 @@ final class LXUserAPIService: ObservableObject {
             DiagnosticLogger.shared.warning("没有选中的 LX 音源，跳过加载", category: "source")
             return
         }
-        guard let preloadURL = Self.preloadScriptURL(),
+        let isPlugin = loadedKind == .musicFree
+        let preloadName = isPlugin ? "MusicFreePreload" : "LXUserAPIPreload"
+        guard let preloadURL = Self.preloadScriptURL(preloadName),
               let preload = try? String(contentsOf: preloadURL, encoding: .utf8) else {
             pendingInitializationID = nil
-            statusMessage = "LX 预加载桥接文件不存在"
+            statusMessage = "\(preloadName) 预加载桥接文件不存在"
             DiagnosticLogger.shared.error(
-                "找不到 LXUserAPIPreload.js（已检查 main bundle 与所有内嵌 .bundle），跳过脚本加载",
+                "找不到 \(preloadName).js（已检查 main bundle 与所有内嵌 .bundle），跳过脚本加载",
                 category: "source"
             )
             return
@@ -165,26 +232,35 @@ final class LXUserAPIService: ObservableObject {
             DiagnosticLogger.shared.error("LX 桥接脚本执行失败: \(exception.toString())", category: "source")
             return
         }
-        let setup = js.objectForKeyedSubscript("lx_setup")
+        let setupName = isPlugin ? "mf_setup" : "lx_setup"
+        let setup = js.objectForKeyedSubscript(setupName)
         setup?.call(withArguments: [key, source.id, source.name, source.description,
                                     source.version, source.author, source.homepage, source.script])
         if let exception = js.exception {
             context = nil
             pendingInitializationID = nil
-            statusMessage = "LX 音源初始化失败：\(exception.toString())"
-            DiagnosticLogger.shared.error("lx_setup 初始化失败: \(exception.toString())", category: "source")
+            statusMessage = "\(isPlugin ? "插件" : "LX 音源")初始化失败：\(exception.toString())"
+            DiagnosticLogger.shared.error("\(setupName) 初始化失败: \(exception.toString())", category: "source")
             return
         }
-        DiagnosticLogger.shared.info("开始执行用户导入的音源脚本", category: "source")
-        _ = js.evaluateScript(source.script)
-        if let exception = js.exception {
-            context = nil
-            pendingInitializationID = nil
-            statusMessage = "LX 音源脚本错误：\(exception.toString())"
-            logger.error("Failed to load LX source \(source.name, privacy: .private): \(exception.toString(), privacy: .private)")
-            DiagnosticLogger.shared.error("用户音源脚本执行失败: \(exception.toString())", category: "source")
+        if isPlugin {
+            // CommonJS evaluation happens inside mf_setup; evaluating the raw
+            // script again here would execute it outside the module wrapper.
+            if context != nil {
+                DiagnosticLogger.shared.info("MusicFree 插件加载完成: \(source.name)", category: "plugin")
+            }
         } else {
-            DiagnosticLogger.shared.info("音源脚本加载完成", category: "source")
+            DiagnosticLogger.shared.info("开始执行用户导入的音源脚本", category: "source")
+            _ = js.evaluateScript(source.script)
+            if let exception = js.exception {
+                context = nil
+                pendingInitializationID = nil
+                statusMessage = "LX 音源脚本错误：\(exception.toString())"
+                logger.error("Failed to load LX source \(source.name, privacy: .private): \(exception.toString(), privacy: .private)")
+                DiagnosticLogger.shared.error("用户音源脚本执行失败: \(exception.toString())", category: "source")
+            } else {
+                DiagnosticLogger.shared.info("音源脚本加载完成", category: "source")
+            }
         }
         if context != nil {
             scheduleInitializationFallback(for: source.id)
@@ -194,8 +270,7 @@ final class LXUserAPIService: ObservableObject {
     /// Never reference `Bundle.module` here: the generated SwiftPM accessor
     /// force-unwraps the resource bundle and traps when a re-signer drops it.
     /// Look in the main bundle and every embedded `.bundle` instead.
-    private static func preloadScriptURL() -> URL? {
-        let resource = "LXUserAPIPreload"
+    private static func preloadScriptURL(_ resource: String = "LXUserAPIPreload") -> URL? {
         if let url = Bundle.main.url(forResource: resource, withExtension: "js") {
             return url
         }
@@ -394,6 +469,24 @@ final class LXUserAPIService: ObservableObject {
                                      detail: "请先导入并启用一个 LX User API 音源。")
         }
         return await checkSource(source)
+    }
+
+    /// Read-only health report for imported MusicFree plugins. It loads each
+    /// plugin in an isolated context and reports which methods were detected;
+    /// the selected source and the active playback context are never touched.
+    func musicFreePluginReport() async -> [String] {
+        let plugins = LXSourceStore.shared.sources.filter { $0.kind == .musicFree }
+        guard !plugins.isEmpty else { return ["未导入 MusicFree 插件。"] }
+        var lines: [String] = []
+        for source in plugins {
+            let checker = LXUserAPIService()
+            checker.load(source)
+            await checker.waitForSourceReady()
+            let actions = checker.capabilities.values.first?.joined(separator: "、") ?? "无"
+            let status = checker.statusMessage.isEmpty ? "无状态信息" : checker.statusMessage
+            lines.append("\(source.name)：\(status)；接口：\(actions)")
+        }
+        return lines
     }
 
     /// Checks any imported source in an isolated JavaScript context. Testing a
@@ -709,6 +802,64 @@ final class LXUserAPIService: ObservableObject {
             }
         }
         js.setObject(timeout, forKeyedSubscript: "__lx_native_call__set_timeout" as NSString)
+
+        // ---- MusicFree plugin bridge (unused by LX sources) ----
+        let mfHTTP: @convention(block) (String) -> Void = { [weak self] json in
+            guard let self else { return }
+            Task { @MainActor in self.handleMusicFreeHTTP(json) }
+        }
+        let mfSetTimeout: @convention(block) (String, Int) -> Void = { [weak self] timerID, delay in
+            guard let self else { return }
+            Task { @MainActor in self.scheduleMusicFreeTimer(id: timerID, delayMS: delay, repeats: false) }
+        }
+        let mfSetInterval: @convention(block) (String, Int) -> Void = { [weak self] timerID, delay in
+            guard let self else { return }
+            Task { @MainActor in self.scheduleMusicFreeTimer(id: timerID, delayMS: delay, repeats: true) }
+        }
+        let mfClearTimer: @convention(block) (String) -> Void = { [weak self] timerID in
+            guard let self else { return }
+            Task { @MainActor in
+                self.mfTimers.removeValue(forKey: timerID)?.cancel()
+            }
+        }
+        let mfHash: @convention(block) (String, String) -> String = { algo, text in
+            hashHex(algorithm: algo, text: text)
+        }
+        let mfHMAC: @convention(block) (String, String, String) -> String = { algo, text, keyHex in
+            guard let key = hexData(keyHex) else { return "" }
+            return hmacHex(algorithm: algo, text: text, key: key)
+        }
+        let mfAES: @convention(block) (String, String, String, String, String, String) -> String = { op, inputHex, keyHex, ivHex, mode, padding in
+            aesHex(operation: op, inputHex: inputHex, keyHex: keyHex,
+                   ivHex: ivHex, mode: mode, padding: padding)
+        }
+        let mfB64ToBytes: @convention(block) (String) -> [Int] = { value in
+            guard let data = Data(base64Encoded: value) else { return [] }
+            return data.map { Int($0) }
+        }
+        let mfB64ToString: @convention(block) (String) -> String = { value in
+            guard let data = Data(base64Encoded: value) else { return "" }
+            return String(data: data, encoding: .utf8) ?? ""
+        }
+        let mfGetVar: @convention(block) (String) -> String = { pluginID in
+            let raw = UserDefaults.standard.string(forKey: "mf.userVariables") ?? "{}"
+            guard let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+                  let variables = object[pluginID] as? [String: Any],
+                  let data = try? JSONSerialization.data(withJSONObject: variables, options: [.fragmentsAllowed]) else {
+                return "{}"
+            }
+            return String(data: data, encoding: .utf8) ?? "{}"
+        }
+        js.setObject(mfHTTP, forKeyedSubscript: "__mf_http__" as NSString)
+        js.setObject(mfSetTimeout, forKeyedSubscript: "__mf_set_timeout__" as NSString)
+        js.setObject(mfSetInterval, forKeyedSubscript: "__mf_set_interval__" as NSString)
+        js.setObject(mfClearTimer, forKeyedSubscript: "__mf_clear_timeout__" as NSString)
+        js.setObject(mfHash, forKeyedSubscript: "__mf_hash__" as NSString)
+        js.setObject(mfHMAC, forKeyedSubscript: "__mf_hmac__" as NSString)
+        js.setObject(mfAES, forKeyedSubscript: "__mf_aes__" as NSString)
+        js.setObject(mfB64ToBytes, forKeyedSubscript: "__mf_b642ab__" as NSString)
+        js.setObject(mfB64ToString, forKeyedSubscript: "__mf_b642str__" as NSString)
+        js.setObject(mfGetVar, forKeyedSubscript: "__mf_get_var__" as NSString)
     }
 
     private func handleNativeCall(action: String, data: String) {
@@ -729,8 +880,9 @@ final class LXUserAPIService: ObservableObject {
             sourceInitializationTask = nil
             pendingInitializationID = nil
             guard payload["status"] as? Bool != false else {
-                statusMessage = (payload["errorMessage"] as? String).map { "LX 音源初始化失败：\($0)" }
-                    ?? "LX 音源初始化失败"
+                let label = loadedKind == .musicFree ? "插件" : "LX 音源"
+                statusMessage = (payload["errorMessage"] as? String).map { "\(label)初始化失败：\($0)" }
+                    ?? "\(label)初始化失败"
                 return
             }
             if let info = payload["info"] as? [String: Any],
@@ -778,6 +930,134 @@ final class LXUserAPIService: ObservableObject {
                 pending.removeValue(forKey: requestKey)?.resume(throwing: LXError.javascript(message))
             }
         default: break
+        }
+    }
+
+    // MARK: - MusicFree plugin native bridge
+    // These helpers are installed into every JSContext but are only called by
+    // MusicFreePreload.js. LX sources keep using sendScriptRequest above.
+
+    private func handleMusicFreeHTTP(_ json: String) {
+        guard let bytes = json.data(using: .utf8),
+              let payload = (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any],
+              let urlString = payload["url"] as? String,
+              let url = URL(string: urlString) else {
+            callJS(action: "__mf_http_response__", data: ["error": "插件请求地址无效"])
+            return
+        }
+        let requestID = payload["requestId"] as? String ?? UUID().uuidString
+        let host = url.host ?? ""
+        var request = URLRequest(url: url)
+        request.httpMethod = ((payload["method"] as? String) ?? "GET").uppercased()
+        request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                         forHTTPHeaderField: "User-Agent")
+        if let headers = payload["headers"] as? [String: Any] {
+            headers.forEach { request.setValue(String(describing: $0.value), forHTTPHeaderField: $0.key) }
+        }
+        if let cookie = mfCookies[host]?.joined(separator: "; "), !cookie.isEmpty {
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
+        if let body = payload["body"], !(body is NSNull) {
+            if let text = body as? String {
+                request.httpBody = Data(text.utf8)
+            } else if JSONSerialization.isValidJSONObject(body) {
+                request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            }
+        }
+        if let timeout = payload["timeout"] as? Double, timeout > 0 {
+            request.timeoutInterval = min(timeout / 1000, 60)
+        }
+        let wantsBinary = payload["binary"] as? Bool == true
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.mfHTTPTasks.removeValue(forKey: requestID)
+                let http = response as? HTTPURLResponse
+                if let fields = http?.allHeaderFields {
+                    var newCookies: [String] = []
+                    for (key, value) in fields where String(describing: key).lowercased() == "set-cookie" {
+                        newCookies.append(contentsOf: String(describing: value)
+                            .components(separatedBy: ",")
+                            .compactMap { $0.components(separatedBy: ";").first }
+                            .filter { !$0.isEmpty })
+                    }
+                    if !newCookies.isEmpty {
+                        var stored = self.mfCookies[host] ?? []
+                        for cookie in newCookies {
+                            let name = cookie.components(separatedBy: "=").first ?? ""
+                            stored.removeAll { $0.components(separatedBy: "=").first == name }
+                            stored.append(cookie)
+                        }
+                        self.mfCookies[host] = stored
+                    }
+                }
+                var result: [String: Any] = [
+                    "requestId": requestID,
+                    "status": http?.statusCode ?? 0,
+                    "statusText": HTTPURLResponse.localizedString(forStatusCode: http?.statusCode ?? 0),
+                    "headers": (http?.allHeaderFields ?? [:]).reduce(into: [String: String]()) {
+                        $0[String(describing: $1.key)] = String(describing: $1.value)
+                    }
+                ]
+                if let error {
+                    result["error"] = error.localizedDescription
+                } else {
+                    let raw = data ?? Data()
+                    if wantsBinary {
+                        result["data"] = raw.base64EncodedString()
+                    } else if let json = try? JSONSerialization.jsonObject(with: raw) {
+                        result["data"] = json
+                    } else {
+                        result["data"] = String(data: raw, encoding: .utf8) ?? ""
+                    }
+                }
+                self.callJS(action: "__mf_http_response__", data: result)
+            }
+        }
+        mfHTTPTasks[requestID] = task
+        task.resume()
+    }
+
+    private func scheduleMusicFreeTimer(id: String, delayMS: Int, repeats: Bool) {
+        mfTimers.removeValue(forKey: id)?.cancel()
+        let delay = max(repeats ? 16 : 0, delayMS)
+        mfTimers[id] = Task { @MainActor [weak self] in
+            repeat {
+                do {
+                    try await Task.sleep(for: .milliseconds(delay))
+                } catch {
+                    return
+                }
+                guard let self, !Task.isCancelled else { return }
+                self.callJS(action: "__mf_timer__", data: ["timerId": id])
+                if !repeats { self.mfTimers.removeValue(forKey: id); return }
+            } while true
+        }
+    }
+
+    /// Generic plugin method call. The JS side resolves the returned Promise
+    /// and answers through the standard `response` action, so this reuses the
+    /// same pending-continuation and timeout machinery as LX requests.
+    func requestPlugin(method: String, args: [Any]) async throws -> [String: Any] {
+        guard context != nil else { throw LXError.noSource }
+        let requestKey = "plugin__\(UUID().uuidString)"
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                pending[requestKey] = continuation
+                callJS(action: "pluginInvoke",
+                       data: ["requestKey": requestKey, "method": method, "args": args])
+                requestTimeoutTasks[requestKey] = Task { @MainActor [weak self] in
+                    do { try await Task.sleep(for: .seconds(20)) } catch { return }
+                    guard let self, self.pending[requestKey] != nil else { return }
+                    self.cancelPendingRequest(with: requestKey, error: LXError.requestTimedOut)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.cancelPendingRequest(with: requestKey) }
         }
     }
 
@@ -896,6 +1176,10 @@ final class LXUserAPIService: ObservableObject {
         pendingInitializationID = nil
         tasks.values.forEach { $0.cancel() }
         tasks.removeAll()
+        mfHTTPTasks.values.forEach { $0.cancel() }
+        mfHTTPTasks.removeAll()
+        mfTimers.values.forEach { $0.cancel() }
+        mfTimers.removeAll()
         scriptRequestKeys.removeAll()
         key = UUID().uuidString
         context = nil
@@ -918,6 +1202,10 @@ final class LXUserAPIService: ObservableObject {
         requestTimeoutTasks.removeAll()
         tasks.values.forEach { $0.cancel() }
         tasks.removeAll()
+        mfHTTPTasks.values.forEach { $0.cancel() }
+        mfHTTPTasks.removeAll()
+        mfTimers.values.forEach { $0.cancel() }
+        mfTimers.removeAll()
         scriptRequestKeys.removeAll()
         context = nil
         loadedID = nil
@@ -1075,6 +1363,10 @@ final class LXUserAPIService: ObservableObject {
         }
         tasks.values.forEach { $0.cancel() }
         tasks.removeAll()
+        mfHTTPTasks.values.forEach { $0.cancel() }
+        mfHTTPTasks.removeAll()
+        mfTimers.values.forEach { $0.cancel() }
+        mfTimers.removeAll()
         scriptRequestKeys.removeAll()
         context = nil
         loadedID = nil
@@ -1336,6 +1628,10 @@ final class LXUserAPIService: ObservableObject {
             "albumId": albumID,
             "types": qualityInfo,
             "_types": qualityMap,
+            // MusicFree plugins receive the original item they produced for
+            // search results. LX sources simply ignore these extra keys.
+            "mfItem": track.sourceMetadata["mf.itemJSON"] ?? "",
+            "mfPlatform": track.sourceMetadata["mf.platform"] ?? track.source ?? "",
         ]
         switch platform {
         case "kg":
@@ -1467,5 +1763,101 @@ private func rsaEncrypt(input: String, publicKey: String, padding: String) -> St
     let algorithm: SecKeyAlgorithm = padding == "RSA/ECB/NoPadding" ? .rsaEncryptionRaw : .rsaEncryptionOAEPSHA1
     guard let encrypted = SecKeyCreateEncryptedData(key, algorithm, inputData as CFData, nil) as Data? else { return "" }
     return encrypted.base64EncodedString()
+}
+
+// MARK: - MusicFree crypto facade (CommonCrypto, no third-party libraries)
+
+private func hexData(_ hex: String) -> Data? {
+    guard hex.count % 2 == 0 else { return nil }
+    var data = Data()
+    var index = hex.startIndex
+    while index < hex.endIndex {
+        let next = hex.index(index, offsetBy: 2)
+        guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
+        data.append(byte)
+        index = next
+    }
+    return data
+}
+
+private func hashedHex(_ bytes: [UInt8]) -> String {
+    bytes.map { String(format: "%02x", $0) }.joined()
+}
+
+private func hashHex(algorithm: String, text: String) -> String {
+    let data = Data(text.utf8)
+    let count = data.count
+    switch algorithm.lowercased() {
+    case "md5":
+        var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
+        data.withUnsafeBytes { _ = CC_MD5($0.baseAddress, CC_LONG(count), &digest) }
+        return hashedHex(digest)
+    case "sha1":
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        data.withUnsafeBytes { _ = CC_SHA1($0.baseAddress, CC_LONG(count), &digest) }
+        return hashedHex(digest)
+    case "sha224":
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA224_DIGEST_LENGTH))
+        data.withUnsafeBytes { _ = CC_SHA224($0.baseAddress, CC_LONG(count), &digest) }
+        return hashedHex(digest)
+    case "sha384":
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA384_DIGEST_LENGTH))
+        data.withUnsafeBytes { _ = CC_SHA384($0.baseAddress, CC_LONG(count), &digest) }
+        return hashedHex(digest)
+    case "sha512":
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA512_DIGEST_LENGTH))
+        data.withUnsafeBytes { _ = CC_SHA512($0.baseAddress, CC_LONG(count), &digest) }
+        return hashedHex(digest)
+    default:
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes { _ = CC_SHA256($0.baseAddress, CC_LONG(count), &digest) }
+        return hashedHex(digest)
+    }
+}
+
+private func hmacHex(algorithm: String, text: String, key: Data) -> String {
+    let algorithmType: CCHmacAlgorithm
+    let length: Int
+    switch algorithm.lowercased() {
+    case "md5": (algorithmType, length) = (CCHmacAlgorithm(kCCHmacAlgMD5), Int(CC_MD5_DIGEST_LENGTH))
+    case "sha1": (algorithmType, length) = (CCHmacAlgorithm(kCCHmacAlgSHA1), Int(CC_SHA1_DIGEST_LENGTH))
+    case "sha512": (algorithmType, length) = (CCHmacAlgorithm(kCCHmacAlgSHA512), Int(CC_SHA512_DIGEST_LENGTH))
+    default: (algorithmType, length) = (CCHmacAlgorithm(kCCHmacAlgSHA256), Int(CC_SHA256_DIGEST_LENGTH))
+    }
+    var digest = [UInt8](repeating: 0, count: length)
+    let textData = Data(text.utf8)
+    key.withUnsafeBytes { keyBuffer in
+        textData.withUnsafeBytes { textBuffer in
+            CCHmac(algorithmType, keyBuffer.baseAddress, key.count,
+                   textBuffer.baseAddress, textData.count, &digest)
+        }
+    }
+    return hashedHex(digest)
+}
+
+private func aesHex(operation: String, inputHex: String, keyHex: String,
+                    ivHex: String, mode: String, padding: String) -> String {
+    guard let input = hexData(inputHex), let key = hexData(keyHex) else { return "" }
+    let iv = hexData(ivHex) ?? Data(repeating: 0, count: kCCBlockSizeAES128)
+    let isEncrypt = operation.lowercased() == "encrypt"
+    var options: CCOptions = padding.lowercased() == "nopadding"
+        ? CCOptions(0) : CCOptions(kCCOptionPKCS7Padding)
+    if mode.uppercased() == "ECB" { options |= CCOptions(kCCOptionECBMode) }
+    var output = [UInt8](repeating: 0, count: input.count + kCCBlockSizeAES128 * 2)
+    var moved = 0
+    let status = input.withUnsafeBytes { inputBuffer in
+        key.withUnsafeBytes { keyBuffer in
+            iv.withUnsafeBytes { ivBuffer in
+                CCCrypt(isEncrypt ? CCOperation(kCCEncrypt) : CCOperation(kCCDecrypt),
+                        CCAlgorithm(kCCAlgorithmAES), options,
+                        keyBuffer.baseAddress, key.count,
+                        mode.uppercased() == "ECB" ? nil : ivBuffer.baseAddress,
+                        inputBuffer.baseAddress, input.count,
+                        &output, output.count, &moved)
+            }
+        }
+    }
+    guard status == kCCSuccess else { return "" }
+    return hashedHex(Array(output.prefix(moved)))
 }
 #endif

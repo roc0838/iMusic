@@ -93,6 +93,41 @@ class DiagnosticsBuildTests(unittest.TestCase):
         self.assertIsNotNone(build)
         self.assertGreaterEqual(int(build.group(1)), 203)
 
+    def test_musicfree_preload_is_packaged_and_verified(self):
+        preload = SOURCES / "MusicFreePreload.js"
+        self.assertTrue(preload.exists(), "MusicFree 插件运行时缺失")
+        text = preload.read_text(encoding="utf-8")
+        self.assertIn("globalThis.mf_setup", text)
+        self.assertIn("globalThis.__lx_native__", text)
+        self.assertIn("getMediaSource", text)
+        self.assertIn("getLyric", text)
+        package = (ROOT / "platforms" / "ios" / "Package.swift").read_text(encoding="utf-8")
+        self.assertIn('.copy("MusicFreePreload.js")', package)
+        self.assertIn("MusicFreePreload.js", WORKFLOW.read_text(encoding="utf-8"))
+
+    def test_lx_sandbox_is_not_contaminated_by_plugin_runtime(self):
+        """MusicFree needs eval/CommonJS; LX must keep its frozen sandbox."""
+        lx = (SOURCES / "LXUserAPIPreload.js").read_text(encoding="utf-8")
+        mf = (SOURCES / "MusicFreePreload.js").read_text(encoding="utf-8")
+        self.assertNotIn("mf_setup", lx)
+        self.assertNotIn("Object.freeze(globalThis)", mf)
+        service = (SOURCES / "Core" / "API" / "LXUserAPIService.swift").read_text(encoding="utf-8")
+        self.assertIn('isPlugin ? "MusicFreePreload" : "LXUserAPIPreload"', service)
+        self.assertIn('isPlugin ? "mf_setup" : "lx_setup"', service)
+
+    def test_plugin_search_uses_an_isolated_resolver(self):
+        service = (SOURCES / "Core" / "API" / "LXUserAPIService.swift").read_text(encoding="utf-8")
+        self.assertIn("pluginSearchResolver", service)
+        catalog = (SOURCES / "Core" / "API" / "LXCatalogService.swift").read_text(encoding="utf-8")
+        self.assertIn("musicFreeSearch(", catalog)
+        self.assertIn("keyword: keyword, page: page, limit: limit", catalog)
+        self.assertIn("group.addTask", catalog)
+
+    def test_log_export_remains_available(self):
+        diagnostics = (SOURCES / "Core" / "Diagnostics" / "DiagnosticsView.swift").read_text(encoding="utf-8")
+        self.assertIn("ShareLink(item: shareURL)", diagnostics)
+        self.assertIn("iMusicDiagnostics", diagnostics)
+
     def test_workflow_stamps_the_configured_build_number(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("CURRENT_PROJECT_VERSION: ${{ steps.version.outputs.build }}", text)

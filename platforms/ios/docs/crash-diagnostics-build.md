@@ -1,5 +1,42 @@
 # iOS 自签闪退诊断版说明
 
+## 2.1.0：新增 MusicFree 插件兼容（2026-11-18）
+
+这一版在**不改动播放主链、锁屏 / 控制中心歌词、CarPlay**的前提下，增加了
+MusicFree 插件支持。没有内置任何插件或音源，所有插件都由用户自己导入。
+
+**隔离方式**：`LXUserAPIPreload.js` 会递归冻结 `globalThis` 并禁用
+`eval` / `Function`，而 MusicFree 插件是 CommonJS 模块，两者不能共用沙箱。
+因此新增独立的 `MusicFreePreload.js`，在独立 `JSContext` 里运行；原生侧的
+网络代理、加密、定时器、Cookie jar 在两侧共用。
+
+**沿用现有逻辑的做法**：插件方法的返回值被翻译成 LX 报文契约——
+`getMediaSource` → `musicUrl` 响应 `{data:{url:...}}`，`getLyric` → `lyric`
+响应 `{data:{lyric:...}}`。于是播放仍走 `resolveMusicURLAcrossSources` 的
+逐音源尝试与失败回退，歌词仍走原来的 `resolveLyrics` → 锁屏 / 控制中心显示
+链路。聚合搜索的 TaskGroup 增加了一个插件搜索分支，`IMusicItem` 被转换成
+`Track`，原始 item 完整保存在 `sourceMetadata["mf.itemJSON"]`，播放时原样
+交回插件，避免字段丢失。
+
+**已提供的 JS 全局**：`require`（axios / cheerio / crypto-js / dayjs / he /
+qs / big-integer / url / buffer / path）、`URL`、`URLSearchParams`、`Buffer`、
+`atob` / `btoa`、`setTimeout` / `setInterval` 及 `env.getUserVariables()`。
+其中 axios 接到原生 URLSession（带按域名 Cookie 持久化与 arraybuffer 支持），
+cheerio 是覆盖常用 CSS 选择器的内置实现，crypto-js 由 CommonCrypto 支撑。
+
+**实测覆盖率**：用 `musicfre插件` 目录的 69 个真实插件做加载测试，
+65 个成功加载。失败的 4 个中，2 个依赖尚未实现的 `webdav` 模块，
+2 个（酷我音乐Thomas / 酷狗Thomas）自身存在 `let t, z = z || ...`
+的重复声明，在 Node 原生环境同样无法加载。搜索 / 播放的实际成功率还
+取决于插件服务端是否可用。
+
+**排错**：设置 → 诊断 →「检测 MusicFree 插件」可在不切换当前音源的前提下
+读取每个插件声明的方法；插件搜索、播放、歌词的关键步骤都会写入诊断日志
+（category 为 `plugin`），导出方式与崩溃日志完全相同。
+
+**已知边界**：榜单、歌单详情、评论等插件方法未接入，这些功能仍由应用内置
+目录接口提供；需要登录 Cookie、WebDAV、二进制流处理的插件可能需要额外适配。
+
 ## 2.0.3：真机日志已定位并修复根因（2026-11-18）
 
 诊断版导出的 `iMusic-Diagnostics-20261118-162720.txt` 给出了确切崩溃栈：

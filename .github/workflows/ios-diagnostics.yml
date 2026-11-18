@@ -144,6 +144,10 @@ jobs:
             exit 1
           fi
           unzip -l "dist/$IPA_NAME" | grep -F 'Payload/iMusic.app/' >/dev/null
+          # Both protocol preloads must ship: a re-signer that drops resource
+          # bundles otherwise breaks sources at first use, not at build time.
+          unzip -l "dist/$IPA_NAME" | grep -F 'LXUserAPIPreload.js' >/dev/null
+          unzip -l "dist/$IPA_NAME" | grep -F 'MusicFreePreload.js' >/dev/null
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4

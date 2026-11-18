@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.0 - 2026-11-18
+
+### Added / 新增
+
+- **兼容 MusicFree 插件**：新增独立的 `MusicFreePreload.js` 运行时（CommonJS 加载器、axios / cheerio / crypto-js / dayjs / he / qs / big-integer / Buffer / URL 等 shim），与 LX 沙箱完全隔离；不内置任何插件。插件 `getMediaSource` / `getLyric` 被翻译成 LX 报文，直接复用原有的多音源播放回退与歌词链路，**未改动锁屏 / 控制中心歌词和 CarPlay 相关代码**。
+- 插件搜索并入聚合搜索 TaskGroup；`IMusicItem` → `Track` 转换保留原始 item，播放时原样回传插件。音源列表标注「插件」类型。
+- 设置 → 诊断中新增「检测 MusicFree 插件」，读取插件声明的方法而不切换当前音源；插件加载 / 搜索 / 播放全过程写入可导出的诊断日志。
+- 原生桥新增按域名 Cookie 持久化、arraybuffer 响应、md5 / SHA 系列 / HMAC / AES（CommonCrypto）与定时器支持。
+
 ## 2.0.3 - 2026-11-18
 
 ### Fixed / 修复
