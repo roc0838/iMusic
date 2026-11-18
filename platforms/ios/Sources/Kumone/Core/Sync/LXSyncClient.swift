@@ -891,7 +891,7 @@ final class LXSyncService: ObservableObject {
             return NSNull()
         case "list_sync_set_list_data":
             guard let raw = arguments.first,
-                  let serialized = try? JSONSerialization.data(withJSONObject: raw, options: [.fragmentsAllowed]),
+                  let serialized = SafeJSON.encodedData(raw),
                   let decoded = try? JSONDecoder().decode(LXSyncListData.self, from: serialized) else {
                 throw LXSyncError.invalidServerResponse
             }
@@ -1033,7 +1033,7 @@ final class LXSyncService: ObservableObject {
 
     private static func decode<T: Decodable>(_ type: T.Type, from rawValue: Any?) -> T? {
         guard let rawValue,
-              let data = try? JSONSerialization.data(withJSONObject: rawValue, options: [.fragmentsAllowed]) else {
+              let data = SafeJSON.encodedData(rawValue) else {
             return nil
         }
         return try? JSONDecoder().decode(type, from: data)

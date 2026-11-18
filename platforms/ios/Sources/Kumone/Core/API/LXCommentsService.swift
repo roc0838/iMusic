@@ -286,7 +286,7 @@ enum LXCommentsService {
                                     headers: [String: String] = [:]) async throws -> [String: Any] {
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.httpBody = json.flatMap { try? JSONSerialization.data(withJSONObject: $0) } ?? body
+        request.httpBody = json.flatMap { SafeJSON.encodedData($0, allowFragments: false) } ?? body
         request.setValue("iMusic/1.0", forHTTPHeaderField: "User-Agent")
         if json != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }

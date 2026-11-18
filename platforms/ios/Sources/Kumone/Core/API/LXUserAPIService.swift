@@ -68,6 +68,9 @@ final class LXUserAPIService: ObservableObject {
     private var sourceOperationWaiters: [SourceOperationWaiter] = []
     private var selectedSourceReloadPending = false
     private var selectedSourceReloadForced = false
+    /// Only the first few timer callbacks are logged; LX sources schedule a
+    /// lot of timeouts and writing every one would bury the useful lines.
+    private var timeoutDiagnosticCount = 0
     @Published private(set) var capabilities: [String: [String]] = [:]
     @Published private(set) var qualityCapabilities: [String: [String]] = [:]
     @Published private(set) var statusMessage = "未加载音源"
@@ -688,7 +691,21 @@ final class LXUserAPIService: ObservableObject {
 
         let timeout: @convention(block) (Int, Int) -> Void = { [weak self] id, delay in
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(0, delay))) {
-                Task { @MainActor in self?.callJS(action: "__set_timeout__", data: id) }
+                Task { @MainActor in
+                    guard let self else { return }
+                    // This is the exact path that used to abort with SIGABRT
+                    // (NSInvalidArgumentException in NSJSONSerialization).
+                    // Log the first few callbacks so a successful run is
+                    // visible in the exported diagnostics without flooding it.
+                    if self.timeoutDiagnosticCount < 3 {
+                        self.timeoutDiagnosticCount += 1
+                        DiagnosticLogger.shared.info(
+                            "LX setTimeout 回调 #\(self.timeoutDiagnosticCount): id=\(id) delay=\(delay)ms",
+                            category: "source"
+                        )
+                    }
+                    self.callJS(action: "__set_timeout__", data: id)
+                }
             }
         }
         js.setObject(timeout, forKeyedSubscript: "__lx_native_call__set_timeout" as NSString)
@@ -944,13 +961,23 @@ final class LXUserAPIService: ObservableObject {
 
     private func callJS(action: String, data: Any? = nil) {
         guard let context, let function = context.objectForKeyedSubscript("__lx_native__") else { return }
-        let encoded: String?
-        if let data, let json = try? JSONSerialization.data(withJSONObject: data), let string = String(data: json, encoding: .utf8) {
-            encoded = string
-        } else {
-            encoded = nil
+        // NSJSONSerialization throws an uncatchable NSException for a scalar
+        // top-level value. `__set_timeout__` passes an Int, so encode through
+        // SafeJSON, which validates first and emits a JSON fragment instead.
+        let encoded = SafeJSON.encodedString(data)
+        if let data, encoded == nil {
+            DiagnosticLogger.shared.warning(
+                "LX 回传数据无法安全序列化，已省略 data: action=\(action) type=\(type(of: data))",
+                category: "source"
+            )
         }
-        _ = function.call(withArguments: encoded == nil ? [key, action] : [key, action, encoded!])
+        let arguments: [Any]
+        if let encoded {
+            arguments = [key, action, encoded]
+        } else {
+            arguments = [key, action]
+        }
+        _ = function.call(withArguments: arguments)
     }
 
     private func sourceCandidates(for track: Track, action: String = "musicUrl") -> [String] {

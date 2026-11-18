@@ -21,7 +21,9 @@ class UnsignedAssetNameTests(unittest.TestCase):
         self.assertIn('--expected-version "$RELEASE_VERSION"', steps['Inspect IPA contents']['run'])
         self.assertIn('--expected-bundle-id com.jiajia2222.imusic.ios', steps['Inspect IPA contents']['run'])
         config = (root / 'platforms/ios/ios/Config/Shared.xcconfig').read_text(encoding='utf-8')
-        self.assertIn('MARKETING_VERSION = 2.0\n', config)
+        # Keep the asset name tied to the resolved version without pinning a
+        # specific release, so version bumps do not break this guard.
+        self.assertRegex(config, r'(?m)^MARKETING_VERSION = \d+\.\d+(?:\.\d+)?\s*$')
 
 
 if __name__ == '__main__':

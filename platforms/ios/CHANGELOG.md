@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.3 - 2026-11-18
+
+### Fixed / 修复
+
+- **修复「播放、导入歌单及其他操作一律闪退」**（真机日志定位）：`LXUserAPIService` 的 `__set_timeout__` 宿主回调把 `Int` 型定时器 id 作为 JSON 顶层对象传给 `NSJSONSerialization`，Foundation 抛 `NSInvalidArgumentException`（NSException，`try?` 无法捕获），进程以 `SIGABRT` 终止。新增 `SafeJSONEncoding.swift`：递归归一化 JSON 值、拆嵌套 Optional、`isValidJSONObject` 预检，标量顶层值改用 `.fragmentsAllowed` 输出 JSON fragment，保持 LX User API 桥接协议不变。详见 `docs/crash-diagnostics-build.md`。
+- 一并收敛 `LXCommentsService`、`LXSyncClient` 中无保护的 `data(withJSONObject:)` 调用，并移除 `callJS` 的 `encoded!` 强制解包，杜绝同类 NSException。
+- LX 定时器回调写入前 3 条诊断日志，便于真机确认此前必崩的路径已走通。
+- 版本号由 2.0(200) 提升到 **2.0.3(203)**；诊断版 workflow 改用 `Shared.xcconfig` 的 build 号并校验 Info.plist，产物名带版本与 build。
+
 ## Unreleased
 
 - **自签闪退诊断版**：新增常驻诊断日志（`DiagnosticLogger`，实时写入 `Documents/iMusicDiagnostics/session.log`）、崩溃信号 / Objective-C 异常捕获、上次异常退出提示，以及「设置 → 诊断」里的日志查看 / 导出 / 复制 / 另存。日志写盘前自动脱敏，可通过「文件」App 直接取出，即使 App 一操作就闪退也能拿到。详见 `docs/crash-diagnostics-build.md`。

@@ -1,11 +1,49 @@
 # iOS 自签闪退诊断版说明
 
-## 这一版解决什么
+## 2.0.3：真机日志已定位并修复根因（2026-11-18）
+
+诊断版导出的 `iMusic-Diagnostics-20261118-162720.txt` 给出了确切崩溃栈：
+
+```
+[play]   resolveMusicURL 开始: Around the World (TV-Size) / exhigh
+[source] 音源脚本加载完成
+[FATAL]  NSException NSInvalidArgumentException:
+         *** +[NSJSONSerialization dataWithJSONObject:options:error:]:
+         Invalid top-level type in JSON write
+  iMusic  LXUserAPIService.callJS(action:data:) + 320
+  iMusic  LXUserAPIService.installHostFunctions(in:) (timeout 回调) + 132
+[FATAL]  process terminated by signal SIGABRT(6)
+```
+
+**根因**：`LXUserAPIService.installHostFunctions` 里的 `__lx_native_call__set_timeout`
+宿主函数在定时器到期后调用 `callJS(action: "__set_timeout__", data: id)`，`id`
+是 Swift `Int`。旧实现直接把 `Int` 当作 JSON 顶层对象传给
+`JSONSerialization.data(withJSONObject:)`，而 Foundation 只允许数组 / 字典作为
+顶层对象。它抛的是 **Objective-C `NSException`，不是 Swift Error**，所以 `try?`
+完全拦不住，异常一路冒泡到 `objc_exception_throw`，进程以 `SIGABRT` 结束。
+
+时间线也吻合：音源脚本 08:27:13.763 加载完成，08:27:14.134 崩溃，371ms 后
+正是脚本里第一个 `setTimeout` 到期。LX 音源的网络请求、重试、请求队列普遍
+依赖 `setTimeout`，因此**播放、搜索、导入歌单等所有涉及音源的操作都会闪退**。
+这与 iOS 27、自签证书、entitlements 都无关，是纯代码缺陷。
+
+**修复**：新增 `Core/API/SafeJSONEncoding.swift`，所有 LX 桥接的 JSON 写入改走
+`SafeJSON`：先递归归一化（拆嵌套 Optional，把 URL / Date / Data / 自定义类型
+转成 JSON 安全表示），再用 `isValidJSONObject` 预检；标量顶层值改用
+`.fragmentsAllowed` 输出 JSON fragment。JS 侧 `__lx_native__` 用
+`JSON.parse(data)` 期待的正是 `123` 这样的数字字面量，协议完全不变。
+同时收敛了 `LXCommentsService`、`LXSyncClient` 里同类无保护的序列化调用，
+并去掉 `callJS` 中的 `encoded!` 强制解包。
+
+修复版会打印前 3 条 `LX setTimeout 回调 #n: id=... delay=...ms` 日志，
+用于确认此前必崩的路径现在能正常走完，且不会刷屏。
+
+## 2.0 诊断版做了什么
 
 用户环境：iOS 27.0.1，自签（个人证书 / 全能签 / Sideloadly 等）安装，
 播放、导入歌单等操作都会闪退。
 
-源码审查结论：
+首轮源码审查的结论（保留作为排查记录）：
 
 - 当前仓库里的 `LXCatalogService.zzcSign` 已经修掉了 CHANGELOG 0.5.0 记载的
   「iOS 27 启动闪退」（QQ 聚合搜索签名表含索引 40，而 SHA-1 十六进制串只有
@@ -15,8 +53,9 @@
 - 单例初始化、Keychain、UserDefaults、Codable 解码、歌单导入路径都没有 `try!` /
   `as!` / 强制解包。
 
-因此最可能的原因是**设备上装的 IPA 不是从这份源码构建的**（旧包），或者重签
-过程中丢了资源 bundle / Info.plist 键。本版做了三件事：
+首轮据此怀疑 IPA 不是从这份源码构建的（旧包），或重签过程中丢了资源
+bundle / Info.plist 键。日志证明这些加固有效但都不是主因；它们仍然保留，
+因为对自签环境有价值。诊断版做了三件事：
 
 1. 重新从当前源码构建一份干净的未签名 IPA（含已修复的签名越界）。
 2. 针对自签环境加固三条高风险路径：
@@ -38,8 +77,10 @@ GitHub Actions `iOS diagnostics IPA (unsigned, self-sign ready)`
 - runner：`macos-26`（GitHub 托管），Xcode 26.6 / iOS 26.5 SDK。
 - 部署目标降到 iOS 26.0：代码只使用 iOS 26 的 Liquid Glass API，没有 iOS 27
   专有符号；iOS 27.0.1 设备可以正常安装。
-- 产物：`iMusic-iOS-diagnostics-<version>.<run>.ipa`，**未签名**，
+- 产物：`iMusic-iOS-diagnostics-<version>-<build>.ipa`，**未签名**，
   从 Actions 的 Artifacts 下载后用你惯用的工具重签安装。
+- 版本号与 build 号都取自 `ios/Config/Shared.xcconfig`（2.0.3 / 203），
+  构建时会校验写进 Info.plist 的值，避免装到新包却分不清版本。
 
 上游的 `ios-release.yml` / `ios-smoke.yml` 依赖自建 `xcode-27` runner 和 iOS 27
 模拟器，在本 fork 中改为仅手动触发，避免自动跑出无关失败。

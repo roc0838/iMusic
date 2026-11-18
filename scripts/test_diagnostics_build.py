@@ -56,6 +56,48 @@ class DiagnosticsBuildTests(unittest.TestCase):
         self.assertNotIn('Bundle.module.url(forResource: "LXUserAPIPreload"', text)
         self.assertNotIn("installHostFunctions(in: js!)", text)
 
+    def test_lx_bridge_never_serializes_a_scalar_top_level_value(self):
+        """Regression for the SIGABRT captured in the device log.
+
+        `__set_timeout__` passes an Int as the top-level JSON value.
+        NSJSONSerialization raises an *NSException* (not a Swift error) for
+        that, which `try?` cannot catch, so the process aborts. The safe
+        encoder validates first and emits the integer as a JSON fragment.
+        """
+        service = (SOURCES / "Core" / "API" / "LXUserAPIService.swift").read_text(encoding="utf-8")
+        self.assertIn("SafeJSON.encodedString(data)", service)
+        self.assertNotIn("try? JSONSerialization.data(withJSONObject: data)", service)
+        self.assertNotIn("encoded!", service)
+        self.assertIn('callJS(action: "__set_timeout__", data: id)', service)
+
+        encoder = (SOURCES / "Core" / "API" / "SafeJSONEncoding.swift").read_text(encoding="utf-8")
+        self.assertIn("JSONSerialization.isValidJSONObject(normalized)", encoder)
+        self.assertIn(".fragmentsAllowed", encoder)
+        self.assertIn("mirror.displayStyle == .optional", encoder)
+
+    def test_other_lx_json_writes_use_the_safe_encoder(self):
+        for relative in ("Core/API/LXCommentsService.swift", "Core/Sync/LXSyncClient.swift"):
+            with self.subTest(file=relative):
+                text = (SOURCES / relative).read_text(encoding="utf-8")
+                self.assertNotIn("try? JSONSerialization.data(withJSONObject:", text)
+                self.assertIn("SafeJSON.encodedData(", text)
+
+    def test_version_is_newer_than_the_crashing_diagnostics_build(self):
+        text = (CONFIG / "Shared.xcconfig").read_text(encoding="utf-8")
+        match = re.search(r"^MARKETING_VERSION\s*=\s*(\S+)", text, re.M)
+        self.assertIsNotNone(match)
+        parts = tuple(int(part) for part in match.group(1).split("."))
+        self.assertGreater(parts, (2, 0, 0),
+                           "修复版必须比闪退的 2.0 更晚，便于真机确认版本")
+        build = re.search(r"^CURRENT_PROJECT_VERSION\s*=\s*(\d+)", text, re.M)
+        self.assertIsNotNone(build)
+        self.assertGreaterEqual(int(build.group(1)), 203)
+
+    def test_workflow_stamps_the_configured_build_number(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("CURRENT_PROJECT_VERSION: ${{ steps.version.outputs.build }}", text)
+        self.assertIn("iMusic-iOS-diagnostics-${RELEASE_VERSION}-${BUILD_NUMBER}.ipa", text)
+
 
 if __name__ == "__main__":
     unittest.main()
