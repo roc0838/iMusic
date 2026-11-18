@@ -6,6 +6,13 @@ import JavaScriptCore
 import OSLog
 import Security
 
+/// Carries the message of a fatal script error out of `JSContext.exceptionHandler`.
+/// JavaScriptCore clears `JSContext.exception` once the handler runs, so the
+/// context alone cannot tell us that a script was rejected.
+private final class JSScriptErrorBox {
+    var message: String?
+}
+
 /// iOS counterpart of LX Mobile's QuickJS bridge.  The provider script stays
 /// user supplied; this class only implements the LX 2.0 host protocol.
 @MainActor
@@ -58,6 +65,7 @@ final class LXUserAPIService: ObservableObject {
     private var context: JSContext?
     private var key = ""
     private var loadedID: String?
+    private var loadedName: String = ""
     private var loadedScript: String?
     private var tasks: [String: URLSessionDataTask] = [:]
     private var scriptRequestKeys = Set<String>()
@@ -179,6 +187,7 @@ final class LXUserAPIService: ObservableObject {
         pendingInitializationID = source?.id
         context = nil
         loadedID = source?.id
+        loadedName = source?.name ?? ""
         loadedScript = source?.script
         loadedKind = source?.kind ?? .lx
         capabilities = [:]
@@ -213,9 +222,16 @@ final class LXUserAPIService: ObservableObject {
             DiagnosticLogger.shared.error("JSContext() 返回 nil，无法加载音源", category: "source")
             return
         }
+        // Setting `exceptionHandler` makes `JSContext.exception` unreliable: the
+        // handler consumes the value, so `js.exception` comes back nil after a
+        // fatal script error. That is how a preload rejected at parse time was
+        // reported as "plugin loaded". Record the message ourselves and treat
+        // it as the source of truth.
+        let scriptError = JSScriptErrorBox()
         js.exceptionHandler = { _, exception in
             guard let exception else { return }
             let detail = exception.toString() ?? "unknown"
+            scriptError.message = detail
             Logger(subsystem: "com.jiajia2222.imusic.ios", category: "LXSource.Script")
                 .error("JavaScript exception: \(detail, privacy: .private)")
             DiagnosticLogger.shared.error("JavaScript 异常: \(detail)", category: "source")
@@ -223,41 +239,66 @@ final class LXUserAPIService: ObservableObject {
         context = js
         key = UUID().uuidString
         installHostFunctions(in: js)
-        DiagnosticLogger.shared.info("开始执行 LX 预加载桥接脚本", category: "source")
+        DiagnosticLogger.shared.info("开始执行 \(preloadName) 预加载桥接脚本", category: "source")
+        scriptError.message = nil
         js.evaluateScript(preload)
-        if let exception = js.exception {
+        if let failure = Self.scriptFailure(js, scriptError) {
             context = nil
             pendingInitializationID = nil
-            statusMessage = "LX 桥接加载失败：\(exception.toString())"
-            DiagnosticLogger.shared.error("LX 桥接脚本执行失败: \(exception.toString())", category: "source")
+            statusMessage = "\(preloadName) 桥接加载失败：\(failure)"
+            DiagnosticLogger.shared.error(
+                "\(preloadName) 预加载脚本执行失败: \(failure)",
+                category: "source"
+            )
             return
         }
         let setupName = isPlugin ? "mf_setup" : "lx_setup"
-        let setup = js.objectForKeyedSubscript(setupName)
-        setup?.call(withArguments: [key, source.id, source.name, source.description,
-                                    source.version, source.author, source.homepage, source.script])
-        if let exception = js.exception {
+        // A missing entry point used to be silently ignored: `objectForKeyedSubscript`
+        // yields a JSValue wrapping `undefined`, so optional chaining still called
+        // into it and the TypeError was swallowed below. Fail loudly instead.
+        guard let setup = js.objectForKeyedSubscript(setupName), setup.isFunction else {
             context = nil
             pendingInitializationID = nil
-            statusMessage = "\(isPlugin ? "插件" : "LX 音源")初始化失败：\(exception.toString())"
-            DiagnosticLogger.shared.error("\(setupName) 初始化失败: \(exception.toString())", category: "source")
+            let detail = Self.scriptFailure(js, scriptError) ?? "未导出 \(setupName)"
+            statusMessage = "\(isPlugin ? "插件" : "LX 音源")桥接初始化失败：\(detail)"
+            DiagnosticLogger.shared.error(
+                "\(preloadName) 未提供 \(setupName) 入口（\(detail)）",
+                category: isPlugin ? "plugin" : "source"
+            )
+            return
+        }
+        scriptError.message = nil
+        setup.call(withArguments: [key, source.id, source.name, source.description,
+                                   source.version, source.author, source.homepage, source.script])
+        if let failure = Self.scriptFailure(js, scriptError) {
+            context = nil
+            pendingInitializationID = nil
+            statusMessage = "\(isPlugin ? "插件" : "LX 音源")初始化失败：\(failure)"
+            DiagnosticLogger.shared.error("\(setupName) 初始化失败: \(failure)",
+                                          category: isPlugin ? "plugin" : "source")
             return
         }
         if isPlugin {
             // CommonJS evaluation happens inside mf_setup; evaluating the raw
             // script again here would execute it outside the module wrapper.
-            if context != nil {
-                DiagnosticLogger.shared.info("MusicFree 插件加载完成: \(source.name)", category: "plugin")
-            }
+            guard context != nil else { return }
+            // Capabilities arrive through the async native bridge, so readiness
+            // is confirmed in handleNativeCall("init"), not here. Say exactly
+            // that instead of claiming the plugin is loaded.
+            DiagnosticLogger.shared.info(
+                "MusicFree 插件脚本已求值，等待上报接口: \(source.name)",
+                category: "plugin"
+            )
         } else {
             DiagnosticLogger.shared.info("开始执行用户导入的音源脚本", category: "source")
+            scriptError.message = nil
             _ = js.evaluateScript(source.script)
-            if let exception = js.exception {
+            if let failure = Self.scriptFailure(js, scriptError) {
                 context = nil
                 pendingInitializationID = nil
-                statusMessage = "LX 音源脚本错误：\(exception.toString())"
-                logger.error("Failed to load LX source \(source.name, privacy: .private): \(exception.toString(), privacy: .private)")
-                DiagnosticLogger.shared.error("用户音源脚本执行失败: \(exception.toString())", category: "source")
+                statusMessage = "LX 音源脚本错误：\(failure)"
+                logger.error("Failed to load LX source \(source.name, privacy: .private): \(failure, privacy: .private)")
+                DiagnosticLogger.shared.error("用户音源脚本执行失败: \(failure)", category: "source")
             } else {
                 DiagnosticLogger.shared.info("音源脚本加载完成", category: "source")
             }
@@ -265,6 +306,14 @@ final class LXUserAPIService: ObservableObject {
         if context != nil {
             scheduleInitializationFallback(for: source.id)
         }
+    }
+
+    /// Reads a fatal script error from either the context or the handler sink.
+    private static func scriptFailure(_ js: JSContext, _ sink: JSScriptErrorBox) -> String? {
+        if let exception = js.exception, !exception.isUndefined, !exception.isNull {
+            return exception.toString() ?? sink.message
+        }
+        return sink.message
     }
 
     /// Never reference `Bundle.module` here: the generated SwiftPM accessor
@@ -378,27 +427,58 @@ final class LXUserAPIService: ObservableObject {
         guard !playbackSources.isEmpty else { throw LXError.noSource }
 
         let primaryPlatform = canonicalPlatform(track.source ?? track.sourceMetadata["source"]) ?? "wy"
+        // A track produced by a MusicFree plugin only carries that plugin's own
+        // ID space. Try the plugin that produced it first so playback does not
+        // start by loading an unrelated source that cannot serve it.
+        var orderedSources = playbackSources
+        if let originID = track.sourceMetadata["mf.sourceID"],
+           let originIndex = orderedSources.firstIndex(where: { $0.id == originID }) {
+            orderedSources.insert(orderedSources.remove(at: originIndex), at: 0)
+        }
         var failures: [String] = []
+        // A single track used to spend 20 s per candidate platform with no
+        // overall cap, so one dead provider froze playback for minutes. Cap the
+        // whole search: whatever has not answered by then is a failure, and the
+        // player advances instead of hanging.
+        let startedAt = Date()
+        var budgetExhausted = false
 
         // Resolve each route before preparing fallbacks. This honors the
         // selected source and avoids doing catalogue work for backups when the
         // preferred source can play the track.
-        for source in playbackSources {
+        for source in orderedSources {
             try Task.checkCancellation()
             try validateSourceConfiguration(sourceRevision, source: source)
+            if Date().timeIntervalSince(startedAt) > Self.sourceResolveBudget {
+                budgetExhausted = true
+                break
+            }
             let isAvailable = await activate(source)
             try validateSourceConfiguration(sourceRevision, source: source)
             guard isAvailable else {
                 failures.append("\(source.name): unavailable")
+                DiagnosticLogger.shared.warning(
+                    "跳过音源 \(source.name)：加载失败（\(statusMessage.isEmpty ? "未知原因" : statusMessage)）",
+                    category: "play"
+                )
                 continue
             }
             let platforms = sourceCandidates(for: track, action: "musicUrl")
             if platforms.isEmpty {
                 failures.append("\(source.name): no musicUrl platform")
+                DiagnosticLogger.shared.info(
+                    "跳过音源 \(source.name)：未声明 musicUrl 接口（已声明 \(Self.describeCapabilities(capabilities))）",
+                    category: "play"
+                )
                 continue
             }
 
             for platform in platforms {
+                if Date().timeIntervalSince(startedAt) > Self.sourceResolveBudget {
+                    budgetExhausted = true
+                    break
+                }
+                let attemptStartedAt = Date()
                 let requestTrack: Track
                 if platform == primaryPlatform {
                     requestTrack = track
@@ -407,9 +487,17 @@ final class LXUserAPIService: ObservableObject {
                     // a different platform's musicUrl endpoint.
                     guard let matched = await LXCatalogService.matchingTrack(track, on: platform) else {
                         failures.append("\(source.name)/\(platform): track not found")
+                        DiagnosticLogger.shared.info(
+                            "音源 \(source.name)/\(platform) 未命中该歌曲（\(Self.milliseconds(since: attemptStartedAt)) ms）",
+                            category: "play"
+                        )
                         continue
                     }
                     requestTrack = matched
+                }
+                if Date().timeIntervalSince(startedAt) > Self.sourceResolveBudget {
+                    budgetExhausted = true
+                    break
                 }
                 try Task.checkCancellation()
                 try validateSourceConfiguration(sourceRevision, source: source)
@@ -421,6 +509,7 @@ final class LXUserAPIService: ObservableObject {
                     let response = try await request(
                         source: platform,
                         action: "musicUrl",
+                        timeout: Self.remainingSourceBudget(since: startedAt),
                         info: [
                             "type": protocolQualityToken(requested, platform: platform),
                             "musicInfo": musicInfo(
@@ -438,9 +527,19 @@ final class LXUserAPIService: ObservableObject {
                           let scheme = url.scheme?.lowercased(),
                           scheme == "http" || scheme == "https" else {
                         failures.append("\(source.name)/\(platform): invalid URL")
+                        DiagnosticLogger.shared.warning(
+                            "音源 \(source.name)/\(platform) 未返回有效播放地址（\(Self.milliseconds(since: attemptStartedAt)) ms）",
+                            category: "play"
+                        )
                         continue
                     }
 
+                    DiagnosticLogger.shared.info(
+                        "音乐地址来自 音源=\(source.name) 平台=\(platform) "
+                            + "音质=\(requested) 耗时=\(Self.milliseconds(since: attemptStartedAt)) ms "
+                            + "总耗时=\(Self.milliseconds(since: startedAt)) ms",
+                        category: "play"
+                    )
                     // The LX bridge echoes the requested `type`; it cannot
                     // confirm the provider's actual codec or bitrate.
                     return ResolvedURL(url: url, quality: requested,
@@ -449,14 +548,48 @@ final class LXUserAPIService: ObservableObject {
                     if error is CancellationError { throw error }
                     try validateSourceConfiguration(sourceRevision, source: source)
                     failures.append("\(source.name)/\(platform): \(error.localizedDescription)")
+                    DiagnosticLogger.shared.warning(
+                        "音源 \(source.name)/\(platform) 取地址失败（\(Self.milliseconds(since: attemptStartedAt)) ms）：\(error.localizedDescription)",
+                        category: "play"
+                    )
                 }
             }
+            if budgetExhausted { break }
         }
 
+        if budgetExhausted {
+            failures.append("寻源超出 \(Int(Self.sourceResolveBudget)) 秒预算，已放弃剩余音源")
+            DiagnosticLogger.shared.error(
+                "寻源超时，放弃剩余候选: \(track.name)（失败明细：\(failures.joined(separator: " | "))）",
+                category: "play"
+            )
+        }
         if failures.isEmpty {
             throw LXError.sourceUnavailable("No enabled LX source exposes musicUrl")
         }
         throw LXError.resolveFailed(failures)
+    }
+
+    /// Total wall-clock allowance for resolving one track across every source.
+    private static let sourceResolveBudget: TimeInterval = 20
+
+    /// Timeout handed to a single provider call, clamped to what is left of the
+    /// per-track budget so a slow provider cannot outlive it.
+    private static func remainingSourceBudget(since start: Date) -> TimeInterval {
+        let remaining = sourceResolveBudget - Date().timeIntervalSince(start)
+        return max(3, min(12, remaining))
+    }
+
+    private static func milliseconds(since start: Date) -> Int {
+        Int((Date().timeIntervalSince(start) * 1000).rounded())
+    }
+
+    private static func describeCapabilities(_ capabilities: [String: [String]]) -> String {
+        guard !capabilities.isEmpty else { return "无" }
+        return capabilities
+            .map { "\($0.key):\($0.value.joined(separator: "/"))" }
+            .sorted()
+            .joined(separator: " ")
     }
 
     /// Performs a real, read-only musicUrl request against the selected LX
@@ -479,15 +612,63 @@ final class LXUserAPIService: ObservableObject {
         guard !plugins.isEmpty else { return ["未导入 MusicFree 插件。"] }
         var lines: [String] = []
         for source in plugins {
+            let startedAt = Date()
             let checker = LXUserAPIService()
             checker.load(source)
             await checker.waitForSourceReady()
-            let actions = checker.capabilities.values.first?.joined(separator: "、") ?? "无"
-            let status = checker.statusMessage.isEmpty ? "无状态信息" : checker.statusMessage
-            lines.append("\(source.name)：\(status)；接口：\(actions)")
+            let actions = Set(checker.capabilities.values.flatMap { $0 }).sorted()
+            let loadMilliseconds = Self.milliseconds(since: startedAt)
+            guard checker.context != nil, !actions.isEmpty else {
+                let status = checker.statusMessage.isEmpty ? "插件没有上报任何接口" : checker.statusMessage
+                lines.append("\(source.name)：❌ 加载失败（\(status)）")
+                DiagnosticLogger.shared.warning(
+                    "插件体检失败 \(source.name): \(status)",
+                    category: "plugin"
+                )
+                continue
+            }
+            var verdict: [String] = ["接口 \(actions.joined(separator: "/"))", "加载 \(loadMilliseconds) ms"]
+            // Prove the plugin actually runs instead of only reporting that a
+            // script parsed: search once, then resolve the first hit.
+            if actions.contains("search") {
+                do {
+                    let response = try await checker.requestPlugin(
+                        method: "search", args: [Self.pluginSelfTestKeyword, 1, "music"])
+                    let envelope = response["result"] as? [String: Any]
+                    let items = envelope?["data"] as? [[String: Any]] ?? []
+                    verdict.append("搜索 \(items.count) 条")
+                    if actions.contains("getMediaSource"), let first = items.first {
+                        do {
+                            let media = try await checker.requestPlugin(
+                                method: "getMediaSource", args: [first, "standard"])
+                            let data = (media["result"] as? [String: Any])?["data"] as? [String: Any]
+                            if let url = data?["url"] as? String, !url.isEmpty {
+                                verdict.append("播放地址 OK")
+                            } else {
+                                verdict.append("播放地址为空")
+                            }
+                        } catch {
+                            verdict.append("取播放地址失败：\(error.localizedDescription)")
+                        }
+                    }
+                } catch {
+                    verdict.append("搜索失败：\(error.localizedDescription)")
+                }
+            } else {
+                verdict.append("未实现 search")
+            }
+            lines.append("\(source.name)：✅ \(verdict.joined(separator: "，"))")
+            DiagnosticLogger.shared.info(
+                "插件体检通过 \(source.name): \(verdict.joined(separator: "，"))",
+                category: "plugin"
+            )
         }
         return lines
     }
+
+    /// A neutral query that every search-capable plugin can answer with an
+    /// empty list, so the self-test never depends on a provider's catalogue.
+    static let pluginSelfTestKeyword = "晴天"
 
     /// Checks any imported source in an isolated JavaScript context. Testing a
     /// disabled backup must not select it (which would silently enable it),
@@ -726,7 +907,7 @@ final class LXUserAPIService: ObservableObject {
         case noSource
         case resolveFailed([String])
         case sourceUnavailable(String)
-        case requestTimedOut
+        case requestTimedOut(seconds: Int)
         case javascript(String)
 
         var errorDescription: String? {
@@ -738,7 +919,8 @@ final class LXUserAPIService: ObservableObject {
             case .sourceUnavailable(let status):
                 return status.isEmpty ? "LX 音源尚未返回可用播放接口" : status
             case .javascript(let message): return message
-            case .requestTimedOut: return "LX 音源请求超时，请检查音源服务器和网络后重试"
+            case .requestTimedOut(let seconds):
+                return "音源 \(seconds) 秒内没有响应，已跳过"
             }
         }
     }
@@ -881,8 +1063,13 @@ final class LXUserAPIService: ObservableObject {
             pendingInitializationID = nil
             guard payload["status"] as? Bool != false else {
                 let label = loadedKind == .musicFree ? "插件" : "LX 音源"
-                statusMessage = (payload["errorMessage"] as? String).map { "\(label)初始化失败：\($0)" }
-                    ?? "\(label)初始化失败"
+                let reason = payload["errorMessage"] as? String ?? "未提供原因"
+                statusMessage = "\(label)初始化失败：\(reason)"
+                DiagnosticLogger.shared.error(
+                    "\(label)初始化失败: \(loadedName)（\(reason)）",
+                    category: loadedKind == .musicFree ? "plugin" : "source"
+                )
+                context = nil
                 return
             }
             if let info = payload["info"] as? [String: Any],
@@ -903,6 +1090,23 @@ final class LXUserAPIService: ObservableObject {
                 statusMessage = active.isEmpty
                     ? "音源已加载，但没有可用接口"
                     : "音源已加载（\(active.joined(separator: "；"))）"
+                let label = loadedKind == .musicFree ? "MusicFree 插件" : "LX 音源"
+                if active.isEmpty {
+                    DiagnosticLogger.shared.warning(
+                        "\(label)上报了能力表但没有可用接口: \(loadedName)",
+                        category: loadedKind == .musicFree ? "plugin" : "source"
+                    )
+                } else {
+                    DiagnosticLogger.shared.info(
+                        "\(label)就绪: \(loadedName) 接口=[\(active.joined(separator: " ; "))]",
+                        category: loadedKind == .musicFree ? "plugin" : "source"
+                    )
+                }
+            } else {
+                DiagnosticLogger.shared.warning(
+                    "\(loadedKind == .musicFree ? "插件" : "音源")上报了 init 但没有能力表: \(loadedName)",
+                    category: loadedKind == .musicFree ? "plugin" : "source"
+                )
             }
         case "request":
             if let requestKey = payload["requestKey"] as? String,
@@ -1053,7 +1257,8 @@ final class LXUserAPIService: ObservableObject {
                 requestTimeoutTasks[requestKey] = Task { @MainActor [weak self] in
                     do { try await Task.sleep(for: .seconds(20)) } catch { return }
                     guard let self, self.pending[requestKey] != nil else { return }
-                    self.cancelPendingRequest(with: requestKey, error: LXError.requestTimedOut)
+                    self.cancelPendingRequest(with: requestKey,
+                                              error: LXError.requestTimedOut(seconds: 20))
                 }
             }
         } onCancel: {
@@ -1134,7 +1339,10 @@ final class LXUserAPIService: ObservableObject {
         task.resume()
     }
 
-    private func request(source: String, action: String, info: [String: Any]) async throws -> [String: Any] {
+    private func request(source: String,
+                         action: String,
+                         timeout: TimeInterval = 20,
+                         info: [String: Any]) async throws -> [String: Any] {
         guard context != nil else { throw LXError.noSource }
         let requestKey = "request__\(UUID().uuidString)"
         return try await withTaskCancellationHandler {
@@ -1148,12 +1356,15 @@ final class LXUserAPIService: ObservableObject {
                                                     "data": ["source": source, "action": action, "info": info]])
                 requestTimeoutTasks[requestKey] = Task { @MainActor [weak self] in
                     do {
-                        try await Task.sleep(for: .seconds(20))
+                        try await Task.sleep(for: .seconds(timeout))
                     } catch {
                         return
                     }
                     guard let self, self.pending[requestKey] != nil else { return }
-                    self.cancelPendingRequest(with: requestKey, error: LXError.requestTimedOut)
+                    self.cancelPendingRequest(
+                        with: requestKey,
+                        error: LXError.requestTimedOut(seconds: Int(timeout.rounded()))
+                    )
                 }
             }
         } onCancel: {

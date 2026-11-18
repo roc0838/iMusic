@@ -1192,7 +1192,13 @@
     }
     if (!item.source) { item.source = legacy.source || info.source || pluginPlatform; }
     if (!item.qualities) { item.qualities = {}; }
-    item.$(pluginPlatform) = item.$(pluginPlatform) || item;
+    if (!item.platform) { item.platform = pluginPlatform; }
+    // `$` is MusicFree's per-platform marker and is a plain string there.
+    // Never call `$` and assign to its result: assigning to a call expression
+    // is rejected by JavaScriptCore at parse time when the file runs in strict
+    // mode, which aborted this whole preload and made every plugin look
+    // "loaded" while nothing was installed.
+    if (!item.$) { item.$ = pluginPlatform; }
     return item;
   }
 

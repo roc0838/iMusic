@@ -7,11 +7,15 @@ on:
     paths:
       - '.github/workflows/ios-*.yml'
       - 'scripts/test_signed_release_workflow.py'
+      - 'scripts/test_js_preload_syntax.py'
+      - 'platforms/ios/Sources/Kumone/**/*.js'
       - 'website/**'
   pull_request:
     paths:
       - '.github/workflows/ios-*.yml'
       - 'scripts/test_signed_release_workflow.py'
+      - 'scripts/test_js_preload_syntax.py'
+      - 'platforms/ios/Sources/Kumone/**/*.js'
       - 'website/**'
 
 permissions:
@@ -37,6 +41,15 @@ jobs:
         run: python -B -m unittest scripts.test_signed_release_workflow -v
       - name: Test sideload crash-diagnostics build guards
         run: python -B -m unittest scripts.test_diagnostics_build -v
+      - name: Test JavaScript preloads against strict-mode pitfalls
+        run: python -B -m unittest scripts.test_js_preload_syntax -v
+      - name: Parse the shipped preloads with Node
+        run: |
+          set -euo pipefail
+          for file in platforms/ios/Sources/Kumone/*.js; do
+            node --check "$file"
+          done
+
       - name: Test public iOS installation metadata
         working-directory: website
         run: |

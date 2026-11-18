@@ -98,7 +98,7 @@ public struct DiagnosticsView: View {
                 } header: {
                     Text("插件体检")
                 } footer: {
-                    Text("只加载插件并读取它声明的方法，不会切换当前音源或改变播放状态。详细过程会写入诊断日志。")
+                    Text("会真的用「\(LXUserAPIService.pluginSelfTestKeyword)」跑一次插件的搜索，并尝试取第一条的播放地址，用结果证明插件是否生效；不会切换当前音源，也不会改变播放状态。详细过程写入诊断日志的 [plugin] 分类。")
                 }
 
                 Section {

@@ -409,6 +409,24 @@ final class PlayerService: ObservableObject {
     private var lyricsResolutionTask: Task<Void, Never>?
     private var seekCoordinator = PlaybackSeekCoordinator()
     private var consecutiveFailures = 0
+    /// How many queue entries in a row may fail to resolve before playback
+    /// stops instead of skipping. Kept small: a dead source should not silently
+    /// burn through the whole queue, but one bad track must never stall it.
+    private static let maxConsecutivePlaybackFailures = 3
+
+    /// Only transient failures are worth a second identical request. An
+    /// exhausted candidate list is deterministic.
+    private static func isRetryableResolveFailure(_ error: Error) -> Bool {
+        if let lx = error as? LXUserAPIService.LXError {
+            switch lx {
+            case .requestTimedOut, .javascript, .sourceUnavailable:
+                return true
+            case .noSource, .resolveFailed:
+                return false
+            }
+        }
+        return error is URLError
+    }
     private var scrobbled = false
     private var startScrobbled = false
 #if os(iOS)
@@ -1444,9 +1462,9 @@ final class PlayerService: ObservableObject {
                 var resolved: LXUserAPIService.ResolvedURL?
                 var lastError: Error?
                 // A signed source URL can expire or fail once while the
-                // provider is waking up. Retry the same track once before
-                // reporting a playback failure; advancing the queue here
-                // would make an intermittent QQ result look like a wrong song.
+                // provider is waking up, so a transient failure is retried.
+                // An exhausted candidate list is deterministic: retrying it
+                // only doubles the wait before the queue moves on.
                 for attempt in 0..<2 {
                     guard !Task.isCancelled, generation == resolveGeneration else { return }
                     do {
@@ -1456,8 +1474,10 @@ final class PlayerService: ObservableObject {
                     } catch {
                         guard generation == resolveGeneration, !Task.isCancelled else { return }
                         lastError = error
-                        if attempt == 0 {
+                        if attempt == 0, Self.isRetryableResolveFailure(error) {
                             try? await Task.sleep(for: .milliseconds(350))
+                        } else {
+                            break
                         }
                     }
                 }
@@ -1470,11 +1490,24 @@ final class PlayerService: ObservableObject {
             } catch {
                 guard generation == resolveGeneration else { return }
                 consecutiveFailures += 1
-                ToastCenter.shared.show("《\(track.name)》播放失败：\(error.localizedDescription)")
-                // A source-level error is not fixed by immediately trying five
-                // more queue entries. Keep the current song visible so the user
-                // can adjust the source or retry after reading the real error.
-                settlePlaybackAsPaused()
+                let reason = error.localizedDescription
+                DiagnosticLogger.shared.error(
+                    "播放失败 #\(consecutiveFailures): \(track.name) -> \(reason)",
+                    category: "play"
+                )
+                // Never leave playback parked on a track that cannot be
+                // resolved: try the next queue entry, and only stop once
+                // several in a row fail (that points at the source, not the
+                // song).
+                if consecutiveFailures < Self.maxConsecutivePlaybackFailures {
+                    ToastCenter.shared.show("《\(track.name)》\(reason)，已自动跳过")
+                    advanceToNext(userInitiated: false)
+                } else {
+                    ToastCenter.shared.show(
+                        "连续 \(consecutiveFailures) 首无法播放，已暂停。请检查音源或网络"
+                    )
+                    settlePlaybackAsPaused()
+                }
                 return
             }
         }
@@ -1510,10 +1543,17 @@ final class PlayerService: ObservableObject {
             let reason = track.playability(privilege: nil,
                                            isLoggedIn: AccountStore.shared.isLoggedIn,
                                            vipType: AccountStore.shared.vipType).reason
+            DiagnosticLogger.shared.error(
+                "播放失败 #\(consecutiveFailures)（无可用地址）: \(track.name)",
+                category: "play"
+            )
             ToastCenter.shared.show(String(localized: "《\(track.name)》无法播放\(reason.map { "：\($0)" } ?? "")"))
-            if consecutiveFailures < 5 {
+            if consecutiveFailures < Self.maxConsecutivePlaybackFailures {
                 advanceToNext(userInitiated: false)
             } else {
+                ToastCenter.shared.show(
+                    "连续 \(consecutiveFailures) 首无法播放，已暂停。请检查音源或网络"
+                )
                 settlePlaybackAsPaused()
             }
             return
