@@ -25,6 +25,10 @@ final class LXUserAPIService: ObservableObject {
         /// API scripts only return a URL, so their requested tier is not proof
         /// of the file's codec or bitrate.
         var qualityIsVerified: Bool = true
+        /// True when playback is about to reuse a link produced earlier. Those
+        /// are the only failures worth re-resolving; a link fetched seconds ago
+        /// that will not play points at the provider instead.
+        var isFromCache: Bool = false
     }
 
     struct ResolvedLyrics {
@@ -91,6 +95,16 @@ final class LXUserAPIService: ObservableObject {
     /// session: shorter probe, tried after the healthy routes. Cleared as soon
     /// as that route answers once.
     private var slowRouteFailures: [String: Int] = [:]
+    /// Resolved direct URLs, keyed by source + track + quality. Resolving is
+    /// the expensive part of starting a song, and the same answer stays usable
+    /// for a while, so both a prefetched track and a repeated one can skip the
+    /// provider walk entirely.
+    private var resolutionCache: [String: CachedResolution] = [:]
+    private var prefetchTask: Task<Void, Never>?
+    /// Provider links carry an expiry that is not visible in the URL for every
+    /// backend, so the cache stays well inside the shortest observed lifetime
+    /// and an expired entry is re-resolved rather than trusted.
+    private static let resolutionCacheTTL: TimeInterval = 12 * 60
     @Published private(set) var capabilities: [String: [String]] = [:]
     @Published private(set) var qualityCapabilities: [String: [String]] = [:]
     @Published private(set) var statusMessage = "未加载音源"
@@ -342,20 +356,66 @@ final class LXUserAPIService: ObservableObject {
         return nil
     }
 
-    func resolveMusicURL(for track: Track, quality: String) async throws -> ResolvedURL {
-        DiagnosticLogger.shared.info("resolveMusicURL 开始: \(track.name) / \(quality)", category: "play")
+    /// A resolved link with the moment it was produced, so playback can tell a
+    /// fresh answer from a stale one.
+    fileprivate struct CachedResolution {
+        let resolved: ResolvedURL
+        let storedAt: Date
+        /// Recorded so the log can tell a warmed-ahead link from a replay of a
+        /// track that was simply played twice.
+        let fromPrefetch: Bool
+    }
+
+    func resolveMusicURL(for track: Track, quality: String,
+                         isPrefetch: Bool = false) async throws -> ResolvedURL {
+        // A real tap always outranks a guess about what plays next: drop the
+        // prefetch so it yields the resolver lock instead of sitting in front
+        // of the request the user is waiting on.
+        if !isPrefetch {
+            cancelPrefetch()
+            if let cached = cachedResolution(for: track, quality: quality) {
+                DiagnosticLogger.shared.info(
+                    "\(cached.fromPrefetch ? "预取命中" : "重播复用"): \(track.name) "
+                        + "缓存年龄=\(Int(Date().timeIntervalSince(cached.storedAt)))s",
+                    category: "play"
+                )
+                var hit = cached.resolved
+                hit.isFromCache = true
+                return hit
+            }
+        }
+        if isPrefetch {
+            DiagnosticLogger.shared.info("预取开始: \(track.name) / \(quality)", category: "play")
+        } else {
+            DiagnosticLogger.shared.info("resolveMusicURL 开始: \(track.name) / \(quality)", category: "play")
+        }
         do {
             try await acquireSourceOperation()
             defer { releaseSourceOperation() }
             try Task.checkCancellation()
             let resolved = try await resolveMusicURLAcrossSources(for: track, quality: quality)
-            DiagnosticLogger.shared.info("resolveMusicURL 成功: \(track.name)", category: "play")
+            storeResolution(resolved, for: track, quality: quality, prefetched: isPrefetch)
+            DiagnosticLogger.shared.info(
+                isPrefetch ? "预取完成: \(track.name)" : "resolveMusicURL 成功: \(track.name)",
+                category: "play"
+            )
             return resolved
         } catch {
             // A song switch cancels the previous resolution. That is normal
             // operation, and logging it as ERROR would hide real failures.
             if error is CancellationError || Task.isCancelled {
-                DiagnosticLogger.shared.info("resolveMusicURL 已取消: \(track.name)", category: "play")
+                DiagnosticLogger.shared.info(
+                    isPrefetch ? "预取已放弃: \(track.name)" : "resolveMusicURL 已取消: \(track.name)",
+                    category: "play"
+                )
+            } else if isPrefetch {
+                // A prefetch that finds nothing is not a playback failure; the
+                // same song is simply resolved again when it is actually
+                // reached.
+                DiagnosticLogger.shared.info(
+                    "预取未命中: \(track.name) -> \(error.localizedDescription)",
+                    category: "play"
+                )
             } else {
                 DiagnosticLogger.shared.error("resolveMusicURL 失败: \(track.name) -> \(error.localizedDescription)", category: "play")
             }
@@ -419,6 +479,65 @@ final class LXUserAPIService: ObservableObject {
             ? ["当前音源没有可用的 musicUrl 平台"]
             : failures)
 #endif
+    }
+
+    // MARK: - Resolution cache and prefetch
+
+    /// Warms the link for the track that will play next, so reaching it costs a
+    /// cache read instead of the full provider walk. Only ever one track ahead:
+    /// every prefetch holds the single resolver lock, and songs further down the
+    /// queue are usually skipped or reordered before they are reached.
+    func prefetchNextTrack(_ track: Track, quality: String) {
+        cancelPrefetch()
+        guard cachedResolution(for: track, quality: quality) == nil else { return }
+        prefetchTask = Task { [weak self] in
+            guard let self else { return }
+            // Cancellation and an empty result are both normal here; the song
+            // is simply resolved again when it is actually reached.
+            _ = try? await self.resolveMusicURL(for: track, quality: quality, isPrefetch: true)
+        }
+    }
+
+    /// Drops any in-flight prefetch. Cancelling is enough to release the
+    /// source-operation lock: `request` observes cancellation and resumes its
+    /// continuation immediately.
+    func cancelPrefetch() {
+        guard prefetchTask != nil else { return }
+        prefetchTask?.cancel()
+        prefetchTask = nil
+    }
+
+    func hasCachedResolution(for track: Track, quality: String) -> Bool {
+        cachedResolution(for: track, quality: quality) != nil
+    }
+
+    /// A cached link that failed to play is worse than no cache at all, so the
+    /// entry is dropped and the next attempt resolves from scratch.
+    func invalidateCachedResolution(for track: Track, quality: String) {
+        resolutionCache.removeValue(forKey: cacheKey(for: track, quality: quality))
+    }
+
+    private func cacheKey(for track: Track, quality: String) -> String {
+        let platform = track.source ?? track.sourceMetadata["source"] ?? "-"
+        return "\(platform)|\(track.id)|\(quality)"
+    }
+
+    private func cachedResolution(for track: Track, quality: String) -> CachedResolution? {
+        let key = cacheKey(for: track, quality: quality)
+        guard let entry = resolutionCache[key] else { return nil }
+        guard Date().timeIntervalSince(entry.storedAt) < Self.resolutionCacheTTL else {
+            resolutionCache.removeValue(forKey: key)
+            return nil
+        }
+        return entry
+    }
+
+    private func storeResolution(_ resolved: ResolvedURL, for track: Track,
+                                 quality: String, prefetched: Bool) {
+        if resolutionCache.count > 200 { resolutionCache.removeAll() }
+        resolutionCache[cacheKey(for: track, quality: quality)] = CachedResolution(
+            resolved: resolved, storedAt: Date(), fromPrefetch: prefetched
+        )
     }
 
     private static func isNeteaseTrack(_ track: Track) -> Bool {
@@ -1869,6 +1988,10 @@ final class LXUserAPIService: ObservableObject {
         // Route health describes the previous source configuration; a new or
         // edited script deserves a fresh measurement.
         slowRouteFailures.removeAll()
+        // Cached links were produced by the previous source configuration; a
+        // disabled or edited source must not keep serving them.
+        cancelPrefetch()
+        resolutionCache.removeAll()
         statusMessage = "音源配置已更新"
         if sourceOperationActive {
             selectedSourceReloadPending = true

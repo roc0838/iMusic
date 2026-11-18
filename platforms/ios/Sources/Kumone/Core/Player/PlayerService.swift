@@ -409,6 +409,16 @@ final class PlayerService: ObservableObject {
     private var lyricsResolutionTask: Task<Void, Never>?
     private var seekCoordinator = PlaybackSeekCoordinator()
     private var consecutiveFailures = 0
+    /// Warms the link for the upcoming track while the current one plays, so
+    /// reaching it costs a cache read instead of the provider walk.
+    private var prefetchTask: Task<Void, Never>?
+    /// Lets a cached link be discarded and re-resolved once before a track is
+    /// declared unplayable, without opening an unbounded retry loop.
+    private var cacheMissRetries = 0
+    /// Whether the link now loaded came from the resolution cache. Only those
+    /// failures mean "the link expired"; a freshly fetched one that will not
+    /// play points at the provider instead.
+    private var currentResolutionFromCache = false
     /// How many queue entries in a row may fail to resolve before playback
     /// stops instead of skipping. Kept small: a dead source should not silently
     /// burn through the whole queue, but one bad track must never stall it.
@@ -1414,6 +1424,17 @@ final class PlayerService: ObservableObject {
         AudioSpectrum.shared.beginPreparing()
         sourceResolutionTask?.cancel()
         lyricsResolutionTask?.cancel()
+        // Any in-flight prefetch belongs to the track order that was in place a
+        // moment ago, and it must never sit in front of this resolution.
+        prefetchTask?.cancel()
+        prefetchTask = nil
+#if os(iOS)
+        // Release the resolver lock now rather than when this track's own
+        // resolution reaches the front of the queue.
+        LXUserAPIService.shared.cancelPrefetch()
+#endif
+        cacheMissRetries = 0
+        currentResolutionFromCache = false
         resolveGeneration += 1
         let generation = resolveGeneration
 
@@ -1449,6 +1470,7 @@ final class PlayerService: ObservableObject {
         var resolvedURL: URL?
         var servedByLXQuality: String?
         var resolvedRequestQuality: String?
+        var resolvedFromCache = false
 #if os(macOS)
         var data: SongURLData?
 #endif
@@ -1496,6 +1518,7 @@ final class PlayerService: ObservableObject {
                 resolvedURL = resolved.url
                 servedByLXQuality = resolved.qualityIsVerified ? resolved.quality : nil
                 resolvedRequestQuality = resolved.quality
+                resolvedFromCache = resolved.isFromCache
             } catch {
                 guard generation == resolveGeneration else { return }
                 consecutiveFailures += 1
@@ -1569,6 +1592,7 @@ final class PlayerService: ObservableObject {
         }
 
         consecutiveFailures = 0
+        currentResolutionFromCache = resolvedFromCache
 #if os(iOS)
         servedQuality = servedByLXQuality
         requestedQuality = resolvedRequestQuality
@@ -1591,6 +1615,10 @@ final class PlayerService: ObservableObject {
         guard generation == resolveGeneration else { return }
 
         let item = AVPlayerItem(asset: asset)
+        // Five seconds of audio is a small buffer, but it covers the gap while
+        // the source is still waking up, which is where the first stutter after
+        // a song change came from.
+        item.preferredForwardBufferDuration = 5
         if let assetTrack, let mix = AudioSpectrum.shared.makeAudioMix(for: assetTrack) {
             item.audioMix = mix
         } else {
@@ -1608,6 +1636,11 @@ final class PlayerService: ObservableObject {
             }
         }
         engine.replaceCurrentItem(with: item)
+        // The current track is live, so the resolver lock is about to be free.
+        // Warm the next queue entry now instead of when it is reached.
+        if generation == resolveGeneration {
+            scheduleNextTrackPrefetch()
+        }
         itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
             guard observedItem.status == .failed else { return }
             let itemID = ObjectIdentifier(observedItem)
@@ -1690,6 +1723,29 @@ final class PlayerService: ObservableObject {
 #endif
     }
 
+    /// Warms the link for exactly one track: whichever the queue plays next.
+    /// Lookahead stays at one because every prefetch holds the single resolver
+    /// lock, and songs further down the queue are usually skipped or reordered
+    /// before they are ever reached.
+    private func scheduleNextTrackPrefetch() {
+        prefetchTask?.cancel()
+        prefetchTask = nil
+#if os(iOS)
+        guard !isFMMode, !LXSourceStore.shared.playbackSources.isEmpty else { return }
+        guard let next = upcomingTracks.first else { return }
+        let quality = SettingsManager.shared.audioQuality.rawValue
+        prefetchTask = Task { [weak self] in
+            // Let the track that just started settle. A burst of skips should
+            // not each pay for a prefetch that is cancelled moments later.
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            LXUserAPIService.shared.prefetchNextTrack(next, quality: quality)
+            guard !Task.isCancelled else { return }
+            self?.prefetchTask = nil
+        }
+#endif
+    }
+
     private func handlePlaybackItemFailure(itemID: ObjectIdentifier,
                                            reason: String?,
                                            generation: Int) {
@@ -1697,6 +1753,33 @@ final class PlayerService: ObservableObject {
               let currentItem = engine.currentItem,
               ObjectIdentifier(currentItem) == itemID,
               isPlaying else { return }
+
+        // A cached link can expire before it is ever played. Drop it and resolve
+        // once more, otherwise an expired cache turns into a track that looks
+        // permanently stuck. Only one retry, so a truly dead source still stops.
+#if os(iOS)
+        if let track = currentTrack, cacheMissRetries < 1, currentResolutionFromCache {
+            let quality = SettingsManager.shared.audioQuality.rawValue
+            cacheMissRetries += 1
+            currentResolutionFromCache = false
+            LXUserAPIService.shared.invalidateCachedResolution(for: track, quality: quality)
+            DiagnosticLogger.shared.info(
+                "缓存地址已失效，重新解析: \(track.name)", category: "play"
+            )
+            sourceResolutionTask?.cancel()
+            isResolvingSource = true
+            resolveGeneration += 1
+            let nextGeneration = resolveGeneration
+            sourceResolutionTask = Task { [weak self] in
+                await self?.resolveAndLoad(track, generation: nextGeneration)
+                if let self, nextGeneration == self.resolveGeneration {
+                    self.sourceResolutionTask = nil
+                }
+            }
+            return
+        }
+#endif
+
         ToastCenter.shared.show("音频源无法播放\(reason.map { "：\($0)" } ?? "")")
         settlePlaybackAsPaused()
     }
