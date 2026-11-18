@@ -256,7 +256,8 @@ final class LXUserAPIService: ObservableObject {
         // A missing entry point used to be silently ignored: `objectForKeyedSubscript`
         // yields a JSValue wrapping `undefined`, so optional chaining still called
         // into it and the TypeError was swallowed below. Fail loudly instead.
-        guard let setup = js.objectForKeyedSubscript(setupName), setup.isFunction else {
+        guard let setup = js.objectForKeyedSubscript(setupName),
+              !setup.isUndefined, !setup.isNull else {
             context = nil
             pendingInitializationID = nil
             let detail = Self.scriptFailure(js, scriptError) ?? "未导出 \(setupName)"
