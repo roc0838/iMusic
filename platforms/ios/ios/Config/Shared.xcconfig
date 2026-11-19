@@ -14,8 +14,8 @@ INFOPLIST_KEY_CFBundleDisplayName = iMusic
 INFOPLIST_KEY_CFBundleDevelopmentRegion = zh-Hans
 // Keep local/Xcode builds on the next app version. CI overrides this
 // with the version from the v* tag and verifies the final app bundle.
-MARKETING_VERSION = 2.1.3
-CURRENT_PROJECT_VERSION = 213
+MARKETING_VERSION = 2.1.4
+CURRENT_PROJECT_VERSION = 214
 DEVELOPMENT_TEAM = 
 CODE_SIGN_STYLE = Automatic
 

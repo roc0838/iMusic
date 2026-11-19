@@ -91,6 +91,22 @@ public struct IOSMainWindow: View {
             }
             .onChange(of: scenePhase) { phase in
                 DiagnosticLogger.shared.info("scenePhase -> \(String(describing: phase))", category: "lifecycle")
+                // Scene-based apps never call the UIApplicationDelegate
+                // didBecomeActive/didEnterBackground hooks (see KumoneIOSApp),
+                // so the crash-detection marker and suspension tracker must be
+                // updated here. Without this the marker stays "running" from
+                // launch until the process dies, and every background kill is
+                // misreported as a crash on the next launch.
+                switch phase {
+                case .active:
+                    DiagnosticLogger.shared.markRunning()
+                    AppLifecycleTracker.shared.markForeground()
+                case .background:
+                    DiagnosticLogger.shared.markBackground()
+                    AppLifecycleTracker.shared.markBackground()
+                default:
+                    break
+                }
                 RenderingBudget.shared.setSceneActive(phase == .active)
                 player.setSceneActive(phase == .active)
                 guard phase == .active else { return }

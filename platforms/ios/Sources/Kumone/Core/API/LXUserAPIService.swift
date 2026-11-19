@@ -572,7 +572,10 @@ final class LXUserAPIService: ObservableObject {
         // per-track ceiling, and additionally cap the first probe of every
         // route: a healthy provider answers in 50–1200 ms, while the 8–10 s
         // outliers in practice never returned a URL at all.
-        let startedAt = Date()
+        // `var` because a background suspension freezes the process while the
+        // wall clock keeps running; the budget is rebased on resume instead of
+        // instantly declaring the whole resolve dead (see the loop below).
+        var startedAt = Date()
         var budgetExhausted = false
         // Routes our own probe cut short, retried once at the very end. Without
         // that a slow-but-playable provider would become a skipped song; with
@@ -585,6 +588,10 @@ final class LXUserAPIService: ObservableObject {
         for source in orderedSources {
             try Task.checkCancellation()
             try validateSourceConfiguration(sourceRevision, source: source)
+            // Returning from the background inflates every wall-clock measure
+            // taken before it. Rebase the anchor so the 20 s budget measures
+            // foreground work only.
+            rebaseAfterSuspension(&startedAt)
             if Date().timeIntervalSince(startedAt) > Self.sourceResolveBudget {
                 budgetExhausted = true
                 break
@@ -613,6 +620,7 @@ final class LXUserAPIService: ObservableObject {
             // Probe the healthy routes first so the broken one cannot decide
             // how long the song takes to start.
             for platform in orderPlatforms(platforms, for: source) {
+                rebaseAfterSuspension(&startedAt)
                 if Date().timeIntervalSince(startedAt) > Self.sourceResolveBudget {
                     budgetExhausted = true
                     break
@@ -718,7 +726,8 @@ final class LXUserAPIService: ObservableObject {
                               track: Track,
                               primaryPlatform: String,
                               quality: String,
-                              budget: TimeInterval) async throws -> RouteOutcome {
+                              budget: TimeInterval,
+                              isSuspendRetry: Bool = false) async throws -> RouteOutcome {
         let sourceRevision = LXSourceStore.shared.configurationRevision
         let attemptStartedAt = Date()
         // A timed-out provider request tears the JavaScript context down
@@ -791,6 +800,27 @@ final class LXUserAPIService: ObservableObject {
             try validateSourceConfiguration(sourceRevision, source: source)
             let elapsed = Self.milliseconds(since: attemptStartedAt)
             if let lx = error as? LXError, case .requestTimedOut = lx {
+                // A timeout that spans a background suspension is not the
+                // provider's fault: the process was frozen mid-probe and the
+                // wall clock kept running. Retry once instead of recording a
+                // slow failure, which would demote a healthy route and skip a
+                // perfectly playable song.
+                let suspended = AppLifecycleTracker.shared.suspensionOverlap(since: attemptStartedAt)
+                if !isSuspendRetry, suspended > 1 {
+                    DiagnosticLogger.shared.info(
+                        "音源 \(source.name)/\(platform) 探测被后台挂起打断（约 \(Int(suspended)) 秒），重试一次",
+                        category: "play"
+                    )
+                    return try await attemptRoute(
+                        source: source,
+                        platform: platform,
+                        track: track,
+                        primaryPlatform: primaryPlatform,
+                        quality: quality,
+                        budget: budget,
+                        isSuspendRetry: true
+                    )
+                }
                 DiagnosticLogger.shared.warning(
                     "音源 \(source.name)/\(platform) 探测超时（\(elapsed) ms，上限 \(Int(budget)) 秒），排到兜底阶段",
                     category: "play"
@@ -803,6 +833,20 @@ final class LXUserAPIService: ObservableObject {
             )
             return .failed("\(source.name)/\(platform): \(error.localizedDescription)")
         }
+    }
+
+    /// Wall-clock budgets stop meaning anything across a background
+    /// suspension: the process was frozen while the clock kept running, so a
+    /// 5 s probe can report 35 s. Rebase the anchor whenever a resume happened
+    /// after it was set, and say so once in the log.
+    private func rebaseAfterSuspension(_ startedAt: inout Date) {
+        let suspension = AppLifecycleTracker.shared.suspensionOverlap(since: startedAt)
+        guard suspension > 1 else { return }
+        DiagnosticLogger.shared.info(
+            "寻源期间后台挂起约 \(Int(suspension)) 秒，预算重新起算",
+            category: "play"
+        )
+        startedAt = Date()
     }
 
     private func routeKey(_ source: LXSourceStore.Source, _ platform: String) -> String {
@@ -881,8 +925,12 @@ final class LXUserAPIService: ObservableObject {
     private static let platformAttemptBudget: TimeInterval = 5
 
     /// A route that burned the full probe this many times in a row is treated
-    /// as broken for the rest of the session.
-    private static let slowRouteFailureThreshold = 3
+    /// as broken for the rest of the session. Two is enough: logs show a broken
+    /// platform (e.g. a provider's `wy` channel) times out on every track, so
+    /// waiting for a third confirmation only spends another full probe on a
+    /// route that has already proven it cannot answer. The slow route is still
+    /// retried in the fallback pass, so nothing playable is lost.
+    private static let slowRouteFailureThreshold = 2
     private static let demotedPlatformAttemptBudget: TimeInterval = 3
     /// Failures returning faster than this are real answers, not slowness.
     private static let slowRouteFailureWindow: TimeInterval = 3

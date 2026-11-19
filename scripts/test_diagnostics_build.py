@@ -128,6 +128,31 @@ class DiagnosticsBuildTests(unittest.TestCase):
         self.assertIn("ShareLink(item: shareURL)", diagnostics)
         self.assertIn("iMusicDiagnostics", diagnostics)
 
+    def test_crash_marker_follows_scene_phase(self):
+        """Scene-based apps never receive applicationDidBecomeActive /
+        applicationDidEnterBackground on the app delegate. If the marker is
+        only written there it stays "running" until the process dies, so every
+        background kill is misreported as a crash on the next launch — which is
+        exactly the "上次运行异常退出 appears on every open" bug."""
+        main_window = (SOURCES / "Features" / "IOSMainWindow.swift").read_text(encoding="utf-8")
+        self.assertIn("DiagnosticLogger.shared.markRunning()", main_window,
+                      "scenePhase .active 必须把标记写回 running")
+        self.assertIn("DiagnosticLogger.shared.markBackground()", main_window,
+                      "scenePhase .background 必须把标记写成 background")
+        tracker = (SOURCES / "Core" / "Diagnostics" / "AppLifecycleTracker.swift")
+        self.assertTrue(tracker.exists(),
+                        "后台挂起会撑爆墙钟超时，需要生命周期跟踪器")
+
+    def test_suspended_probe_is_retried_not_failed(self):
+        """A probe interrupted by an iOS suspension must not count as a slow
+        failure: the process was frozen, so the provider never answered."""
+        service = (SOURCES / "Core" / "API" / "LXUserAPIService.swift").read_text(encoding="utf-8")
+        self.assertIn("suspensionOverlap(since: attemptStartedAt)", service)
+        self.assertIn("isSuspendRetry: true", service,
+                      "挂起打断的探测必须原地重试一次")
+        self.assertIn("rebaseAfterSuspension(&startedAt)", service,
+                      "恢复前台后寻源预算必须重新起算")
+
     def test_workflow_stamps_the_configured_build_number(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("CURRENT_PROJECT_VERSION: ${{ steps.version.outputs.build }}", text)
