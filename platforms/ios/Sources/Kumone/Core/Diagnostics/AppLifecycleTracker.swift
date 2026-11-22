@@ -14,12 +14,23 @@ final class AppLifecycleTracker {
     private let lock = NSLock()
     private var lastBackgroundAt: Date?
     private var lastResumeAt: Date?
+    private var foreground = false
+
+    /// True between a background→foreground resume and the next backgrounding.
+    /// The main-thread watchdog only reports hangs while the app is foreground:
+    /// in the background the whole process is frozen by design.
+    var isForeground: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return foreground
+    }
 
     /// Call from the scene-phase handler when the app leaves the foreground.
     func markBackground() {
         lock.lock()
         defer { lock.unlock() }
         lastBackgroundAt = Date()
+        foreground = false
     }
 
     /// Call from the scene-phase handler when the app becomes active again.
@@ -27,6 +38,7 @@ final class AppLifecycleTracker {
         lock.lock()
         defer { lock.unlock() }
         lastResumeAt = Date()
+        foreground = true
     }
 
     /// Wall-clock seconds the process likely spent suspended after `since`,

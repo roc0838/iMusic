@@ -153,6 +153,40 @@ class DiagnosticsBuildTests(unittest.TestCase):
         self.assertIn("rebaseAfterSuspension(&startedAt)", service,
                       "恢复前台后寻源预算必须重新起算")
 
+    def test_aggregate_search_is_time_bounded(self):
+        """Aggregate search used to await every imported plugin in sequence
+        (74 s with ~66 plugins), so the page looked empty. It must stay within
+        a budget and each plugin request must have its own short timeout."""
+        service = (SOURCES / "Core" / "API" / "LXUserAPIService.swift").read_text(encoding="utf-8")
+        self.assertIn("budget: TimeInterval = 6", service)
+        self.assertIn("插件搜索预算用尽", service)
+        self.assertIn("timeout: max(1.5, min(4, remaining))", service,
+                      "单个插件的搜索超时必须远小于 20 秒")
+        self.assertIn("func requestPlugin(method: String, args: [Any],", service)
+        self.assertIn("timeout: TimeInterval = 20", service,
+                      "播放等其它插件调用仍保留默认 20 秒")
+        catalog = (SOURCES / "Core" / "API" / "LXCatalogService.swift").read_text(encoding="utf-8")
+        self.assertIn("musicFreeSearch(", catalog)
+
+    def test_lyric_lookup_is_capped(self):
+        """Walking all imported sources for lyrics burned the full 15 s budget
+        on tracks that simply have no lyrics."""
+        service = (SOURCES / "Core" / "API" / "LXUserAPIService.swift").read_text(encoding="utf-8")
+        self.assertIn("lyricSourceLimit = 12", service)
+        self.assertIn("lyricCandidateSources(playbackSources)", service)
+        self.assertIn("…等 \\(missed.count) 条", service,
+                      "失败明细必须截断，几十个音源时会写出几千字")
+
+    def test_watchdog_covers_foreground_hangs(self):
+        """A watchdog kill (0x8badf00d) writes nothing on its own; the monitor
+        must report it and stay quiet while the app is backgrounded."""
+        watchdog = (SOURCES / "Core" / "Diagnostics" / "MainThreadWatchdog.swift").read_text(encoding="utf-8")
+        self.assertIn("主线程无响应", watchdog)
+        self.assertIn("AppLifecycleTracker.shared.isForeground", watchdog)
+        logger = (SOURCES / "Core" / "Diagnostics" / "DiagnosticLogger.swift").read_text(encoding="utf-8")
+        self.assertIn("MainThreadWatchdog.shared.start()", logger)
+        self.assertIn("previousLastLogLine", logger)
+
     def test_workflow_stamps_the_configured_build_number(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("CURRENT_PROJECT_VERSION: ${{ steps.version.outputs.build }}", text)

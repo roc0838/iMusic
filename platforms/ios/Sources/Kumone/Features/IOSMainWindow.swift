@@ -104,7 +104,13 @@ public struct IOSMainWindow: View {
                 case .background:
                     DiagnosticLogger.shared.markBackground()
                     AppLifecycleTracker.shared.markBackground()
-                default:
+                case .inactive:
+                    // Transient phases (app switcher, Control Center, call
+                    // banner) also end in a process kill often enough to be
+                    // mistaken for a crash. Downgrade the marker here too, but
+                    // only after the scene has been shown once.
+                    DiagnosticLogger.shared.markInactive()
+                @unknown default:
                     break
                 }
                 RenderingBudget.shared.setSceneActive(phase == .active)
@@ -144,7 +150,7 @@ public struct IOSMainWindow: View {
                 Button("导出诊断日志") { showDiagnostics = true }
                 Button("稍后", role: .cancel) {}
             } message: {
-                Text("检测到上次会话没有正常结束。可以导出日志发来分析；如果 App 又闪退，也可以用「文件」App 从 iMusic → iMusicDiagnostics 里直接取 session.log。")
+                Text(crashNoticeMessage)
             }
             .overlay(alignment: .top) {
                 if let toast = toasts.current {
@@ -154,6 +160,16 @@ public struct IOSMainWindow: View {
                 }
             }
             .animation(.spring(duration: 0.3), value: toasts.current)
+    }
+
+    private var crashNoticeMessage: String {
+        var text = "检测到上次会话在前台运行中被终止（崩溃、卡死被系统强杀，或手动强制关闭都可能是原因）。"
+        let last = DiagnosticLogger.shared.previousLastLogLine
+        if !last.isEmpty {
+            text += "\n\n最后一条日志：\n\(last)"
+        }
+        text += "\n\n可以导出日志分析；也可以用「文件」App 从 iMusic → iMusicDiagnostics 取 session.log。"
+        return text
     }
 
     private var presentationRoot: some View {

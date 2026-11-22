@@ -64,6 +64,7 @@ final class LXUserAPIService: ObservableObject {
     private static let qualityResolver = LXUserAPIService()
     private static let downloadResolver = LXUserAPIService()
     private static let pluginSearchResolver = LXUserAPIService()
+    private static let pluginSearchMemory = SourceSuccessMemory()
 
     private let session: URLSession
     private var context: JSContext?
@@ -132,13 +133,28 @@ final class LXUserAPIService: ObservableObject {
 
     /// Queries every enabled MusicFree plugin with its `search` method.
     /// Results are deliberately kept in a separate resolver so a search never
-    /// replaces the JavaScript context used by active playback or lyrics.
-    func musicFreeSearch(keyword: String, page: Int, limit: Int) async -> [Track] {
+    /// Aggregate search over every enabled plugin.
+    ///
+    /// Plugins run in an isolated resolver, so a slow plugin can never replace
+    /// the JavaScript context used by playback or lyrics. They still share one
+    /// JavaScript context each run, so they have to be queried in sequence —
+    /// with 60-70 imported plugins that used to take well over a minute, and
+    /// the aggregate page looked empty because it simply never finished. A
+    /// budget plus a much shorter per-plugin timeout makes the page answer in
+    /// seconds, and plugins that answered last time go first so the useful
+    /// ones always make the cut.
+    func musicFreeSearch(keyword: String, page: Int, limit: Int,
+                         budget: TimeInterval = 6) async -> [Track] {
         let resolver = Self.pluginSearchResolver
         let store = LXSourceStore.shared
         let revision = store.configurationRevision
         let sources = store.musicFreeSources
         guard !sources.isEmpty else { return [] }
+
+        let ordered = Self.orderByRecentSearchSuccess(sources)
+        let startedAt = Date()
+        var queried = 0
+        var hits = 0
 
         do {
             try await resolver.acquireSourceOperation()
@@ -148,17 +164,30 @@ final class LXUserAPIService: ObservableObject {
         defer { resolver.releaseSourceOperation() }
 
         var collected: [Track] = []
-        for source in sources {
+        for source in ordered {
             guard !Task.isCancelled,
                   store.configurationRevision == revision,
                   store.playbackSources.contains(where: {
                       $0.id == source.id && $0.script == source.script
                   }) else { break }
+
+            let remaining = budget - Date().timeIntervalSince(startedAt)
+            guard remaining > 0.5 else {
+                DiagnosticLogger.shared.info(
+                    "插件搜索预算用尽：已查询 \(queried)/\(ordered.count) 个，"
+                        + "命中 \(hits) 个，用时 \(Self.milliseconds(since: startedAt)) ms",
+                    category: "plugin"
+                )
+                break
+            }
+
             guard await resolver.activate(source) else { continue }
+            queried += 1
             do {
                 let response = try await resolver.requestPlugin(
                     method: "search",
-                    args: [keyword, page, "music"]
+                    args: [keyword, page, "music"],
+                    timeout: max(1.5, min(4, remaining))
                 )
                 guard let envelope = response["result"] as? [String: Any],
                       let items = envelope["data"] as? [[String: Any]] else { continue }
@@ -170,6 +199,10 @@ final class LXUserAPIService: ObservableObject {
                         platform: platform,
                         sourceID: source.id
                     )
+                }
+                if !tracks.isEmpty {
+                    hits += 1
+                    Self.noteSearchSuccess(source.id)
                 }
                 collected.append(contentsOf: tracks.prefix(limit))
                 DiagnosticLogger.shared.info(
@@ -184,7 +217,49 @@ final class LXUserAPIService: ObservableObject {
                 )
             }
         }
+        DiagnosticLogger.shared.info(
+            "插件搜索完成：查询 \(queried)/\(ordered.count) 个，命中 \(hits) 个，"
+                + "共 \(collected.count) 条，用时 \(Self.milliseconds(since: startedAt)) ms",
+            category: "plugin"
+        )
         return collected
+    }
+
+    /// Plugins that produced results last time are queried first, so a tight
+    /// budget is spent on the ones that actually answer.
+    private static func orderByRecentSearchSuccess(_ sources: [LXSourceStore.Source])
+        -> [LXSourceStore.Source] {
+        let snapshot = pluginSearchMemory.snapshot()
+        return sources.enumerated().sorted { lhs, rhs in
+            let left = snapshot[lhs.element.id] ?? .distantPast
+            let right = snapshot[rhs.element.id] ?? .distantPast
+            if left != right { return left > right }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    private static func noteSearchSuccess(_ id: UUID) {
+        pluginSearchMemory.note(id)
+    }
+
+    /// Remembers which plugins answered a search recently. `LXUserAPIService`
+    /// is not actor isolated, so this little store owns its own lock.
+    final class SourceSuccessMemory: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lastSuccess: [UUID: Date] = [:]
+
+        func snapshot() -> [UUID: Date] {
+            lock.lock()
+            defer { lock.unlock() }
+            return lastSuccess
+        }
+
+        func note(_ id: UUID) {
+            lock.lock()
+            defer { lock.unlock() }
+            if lastSuccess.count > 200 { lastSuccess.removeAll() }
+            lastSuccess[id] = Date()
+        }
     }
 
     func resolveDownloadMusicURL(for track: Track, quality: String) async throws -> ResolvedURL {
@@ -1231,11 +1306,16 @@ final class LXUserAPIService: ObservableObject {
         let primaryPlatform = canonicalPlatform(track.source ?? track.sourceMetadata["source"]) ?? "wy"
         let startedAt = Date()
         var missed: [String] = []
+        // With 60+ imported sources this loop used to walk every one of them,
+        // burning the whole 15 s budget on obscure tracks. Sources that have
+        // returned lyrics before go first and only a small window is tried.
+        let candidates = Self.lyricCandidateSources(playbackSources)
         DiagnosticLogger.shared.info(
-            "歌词解析开始: \(track.name)（主平台=\(primaryPlatform)，候选音源=\(playbackSources.count)）",
+            "歌词解析开始: \(track.name)（主平台=\(primaryPlatform)，候选音源=\(playbackSources.count)，"
+                + "实际尝试=\(candidates.count)）",
             category: "lyric"
         )
-        for source in playbackSources {
+        for source in candidates {
             try Task.checkCancellation()
             if Date().timeIntervalSince(startedAt) > Self.lyricResolveBudget {
                 DiagnosticLogger.shared.warning(
@@ -1280,6 +1360,7 @@ final class LXUserAPIService: ObservableObject {
                         try Task.checkCancellation()
                         try validateSourceConfiguration(sourceRevision, source: source)
                         if let lyrics = await lyricPayload(from: response) {
+                            Self.lyricHitMemory.note(source.id)
                             DiagnosticLogger.shared.info(
                                 "歌词命中 音源=\(source.name) 平台=\(platform) "
                                     + "正文=\(lyrics.lyric.count)字 "
@@ -1300,13 +1381,41 @@ final class LXUserAPIService: ObservableObject {
                 missed.append("\(source.name)/\(platform): 无歌词（\(Self.milliseconds(since: attemptStartedAt)) ms）")
             }
         }
+        // Keep the report readable: with dozens of sources the joined detail
+        // used to be thousands of characters long.
+        let detail: String
+        if missed.isEmpty {
+            detail = "无可尝试的组合"
+        } else if missed.count > 12 {
+            detail = missed.prefix(12).joined(separator: " | ") + " | …等 \(missed.count) 条"
+        } else {
+            detail = missed.joined(separator: " | ")
+        }
         DiagnosticLogger.shared.warning(
-            "歌词解析失败: \(track.name)（耗时 \(Self.milliseconds(since: startedAt)) ms，"
-                + "明细：\(missed.isEmpty ? "无可尝试的组合" : missed.joined(separator: " | "))）",
+            "歌词解析失败: \(track.name)（耗时 \(Self.milliseconds(since: startedAt)) ms，明细：\(detail)）",
             category: "lyric"
         )
         throw LXError.resolveFailed([])
     }
+
+    /// How many sources one lyric lookup may try. Lyrics are only useful the
+    /// moment the track starts, so a dozen attempts is plenty; beyond that the
+    /// budget just runs out on providers that never return lyrics.
+    private static let lyricSourceLimit = 12
+
+    private static func lyricCandidateSources(_ sources: [LXSourceStore.Source])
+        -> [LXSourceStore.Source] {
+        let snapshot = lyricHitMemory.snapshot()
+        let ordered = sources.enumerated().sorted { lhs, rhs in
+            let left = snapshot[lhs.element.id] ?? .distantPast
+            let right = snapshot[rhs.element.id] ?? .distantPast
+            if left != right { return left > right }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+        return Array(ordered.prefix(lyricSourceLimit))
+    }
+
+    private static let lyricHitMemory = SourceSuccessMemory()
 
     /// LX source scripts do not all return the same lyric shape. In the wild
     /// `data` may be a string, an object with `lyric`/`lrc`, or an object that
@@ -1691,7 +1800,8 @@ final class LXUserAPIService: ObservableObject {
     /// Generic plugin method call. The JS side resolves the returned Promise
     /// and answers through the standard `response` action, so this reuses the
     /// same pending-continuation and timeout machinery as LX requests.
-    func requestPlugin(method: String, args: [Any]) async throws -> [String: Any] {
+    func requestPlugin(method: String, args: [Any],
+                       timeout: TimeInterval = 20) async throws -> [String: Any] {
         guard context != nil else { throw LXError.noSource }
         let requestKey = "plugin__\(UUID().uuidString)"
         return try await withTaskCancellationHandler {
@@ -1704,10 +1814,10 @@ final class LXUserAPIService: ObservableObject {
                 callJS(action: "pluginInvoke",
                        data: ["requestKey": requestKey, "method": method, "args": args])
                 requestTimeoutTasks[requestKey] = Task { @MainActor [weak self] in
-                    do { try await Task.sleep(for: .seconds(20)) } catch { return }
+                    do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
                     guard let self, self.pending[requestKey] != nil else { return }
                     self.cancelPendingRequest(with: requestKey,
-                                              error: LXError.requestTimedOut(seconds: 20))
+                                              error: LXError.requestTimedOut(seconds: timeout))
                 }
             }
         } onCancel: {

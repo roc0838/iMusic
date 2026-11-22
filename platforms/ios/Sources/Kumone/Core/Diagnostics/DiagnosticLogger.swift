@@ -89,6 +89,14 @@ public final class DiagnosticLogger {
     private var didStartSession = false
     private var pendingCrashNotice = false
     private var handlersInstalled = false
+    /// True once the scene has actually become active. Until then an
+    /// `.inactive` phase is part of launch, not a backgrounding.
+    private var sawActiveScene = false
+    /// Last line written, so the crash notice can say where the app stopped.
+    private var lastWrittenLine = ""
+    /// Last line of the previous session, captured before this session writes
+    /// its own SESSION START. Shown in the crash notice.
+    private var previousSessionLastLine = ""
 
     private let maxLogSize: UInt64 = 2 * 1024 * 1024
     private let maxExportSize = 2 * 1024 * 1024
@@ -128,8 +136,14 @@ public final class DiagnosticLogger {
         lock.unlock()
 
         rotateIfNeeded()
+        // Must run before this session appends anything: the tail belongs to
+        // the previous run, and the crash notice shows it.
+        previousSessionLastLine = readTailLine()
         openLogFile()
         installCrashHandlers()
+        // A watchdog kill leaves no trace of its own; the watchdog turns it
+        // into an explicit log line so the next occurrence is explainable.
+        MainThreadWatchdog.shared.start()
 
         let previousMarker = readMarker()
         writeMarker("running")
@@ -150,6 +164,9 @@ public final class DiagnosticLogger {
     /// Called whenever the app becomes active.
     public func markRunning() {
         writeMarker("running")
+        lock.lock()
+        sawActiveScene = true
+        lock.unlock()
         info("application did become active", category: "lifecycle")
     }
 
@@ -157,6 +174,18 @@ public final class DiagnosticLogger {
     /// not treated as an in-app crash.
     public func markBackground() {
         info("application did enter background", category: "lifecycle")
+        writeMarker("background")
+    }
+
+    /// Called for the transient `.inactive` phase (app switcher, Control
+    /// Center, incoming call). Only downgrades the marker once the app has
+    /// really been shown, so a crash during launch is still reported.
+    public func markInactive() {
+        info("application will resign active", category: "lifecycle")
+        lock.lock()
+        let shown = sawActiveScene
+        lock.unlock()
+        guard shown else { return }
         writeMarker("background")
     }
 
@@ -172,6 +201,21 @@ public final class DiagnosticLogger {
         guard pendingCrashNotice else { return false }
         pendingCrashNotice = false
         return true
+    }
+
+    /// Last line written this session. The crash notice shows it so the dialog
+    /// says where the app stopped instead of only "it crashed".
+    public var lastLogLine: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastWrittenLine
+    }
+
+    /// Last line of the run that ended abnormally (empty when unknown).
+    public var previousLastLogLine: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return previousSessionLastLine
     }
 
     // MARK: - Logging
@@ -202,6 +246,7 @@ public final class DiagnosticLogger {
         // ISO8601DateFormatter is not thread-safe; keep every use under `lock`.
         let stamp = timestampFormatter.string(from: Date())
         let line = "\(stamp) [\(level.rawValue)] [\(category)] [\(thread)] \(cleaned)\n"
+        lastWrittenLine = line.trimmingCharacters(in: .newlines)
         writeLocked(line)
 
         switch level {
@@ -369,6 +414,38 @@ public final class DiagnosticLogger {
     private func readMarker() -> String? {
         guard let value = try? String(contentsOf: markerURL, encoding: .utf8) else { return nil }
         return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Last non-empty line of the existing log, read from the tail so a big
+    /// file costs nothing. Used for the crash notice text.
+    private func readTailLine() -> String {
+        guard let handle = try? FileHandle(forReadingFrom: logURL) else { return "" }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        guard size > 0 else { return "" }
+        let window: UInt64 = 4096
+        let start = size > window ? size - window : 0
+        try? handle.seek(toOffset: start)
+        guard var data = try? handle.readToEnd(), !data.isEmpty else { return "" }
+
+        // The window may slice a multi-byte character in half; drop leading
+        // bytes until the remainder decodes.
+        var text: String?
+        var dropped = 0
+        while dropped < 4, !data.isEmpty {
+            if let decoded = String(data: data, encoding: .utf8) {
+                text = decoded
+                break
+            }
+            data.removeFirst()
+            dropped += 1
+        }
+        guard var text else { return "" }
+        if start > 0, let firstBreak = text.firstIndex(of: "\n") {
+            text = String(text[text.index(after: firstBreak)...])
+        }
+        let line = text.split(separator: "\n").last.map(String.init) ?? ""
+        return String(line.prefix(300))
     }
 
     private func writeMarker(_ value: String) {
