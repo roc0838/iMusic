@@ -238,7 +238,7 @@ final class LXUserAPIService: ObservableObject {
         }.map(\.element)
     }
 
-    private static func noteSearchSuccess(_ id: UUID) {
+    private static func noteSearchSuccess(_ id: String) {
         pluginSearchMemory.note(id)
     }
 
@@ -246,15 +246,15 @@ final class LXUserAPIService: ObservableObject {
     /// is not actor isolated, so this little store owns its own lock.
     final class SourceSuccessMemory: @unchecked Sendable {
         private let lock = NSLock()
-        private var lastSuccess: [UUID: Date] = [:]
+        private var lastSuccess: [String: Date] = [:]
 
-        func snapshot() -> [UUID: Date] {
+        func snapshot() -> [String: Date] {
             lock.lock()
             defer { lock.unlock() }
             return lastSuccess
         }
 
-        func note(_ id: UUID) {
+        func note(_ id: String) {
             lock.lock()
             defer { lock.unlock() }
             if lastSuccess.count > 200 { lastSuccess.removeAll() }
@@ -1817,7 +1817,7 @@ final class LXUserAPIService: ObservableObject {
                     do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
                     guard let self, self.pending[requestKey] != nil else { return }
                     self.cancelPendingRequest(with: requestKey,
-                                              error: LXError.requestTimedOut(seconds: timeout))
+                                              error: LXError.requestTimedOut(seconds: Int(timeout)))
                 }
             }
         } onCancel: {
